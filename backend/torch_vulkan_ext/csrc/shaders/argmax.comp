@@ -1,0 +1,46 @@
+#version 450
+// Global argmax over the whole [rows, cols] matrix, returned as a single uint.
+//
+// Parallel: thread tid starts at flat index tid and strides by the workgroup
+// size, so the full matrix is covered concurrently; a 256-wide shared-memory
+// reduction then picks the winner. Replaces an earlier version that reduced
+// per row and then across rows, which produced wrong results on RADV at
+// cols = 151671.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufIn    { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufOut   { uint  out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+} params;
+
+shared float s_val[256];
+shared uint  s_idx[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint total = params.rows * params.cols;
+
+    float best = -3.4e38;
+    uint best_i = 0u;
+    for (uint i = tid; i < total; i += 256u) {
+        float v = in_data[i];
+        if (v > best) { best = v; best_i = i; }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid]) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) out_data[0] = s_idx[0];
+}

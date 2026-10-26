@@ -1,0 +1,15 @@
+#version 450
+// Minimal readback test: read q[0..127] and k[0..127] through the descriptor
+// set and write them out. If this returns the uploaded values, the descriptor
+// binding is fine and the defect is inside attention2's loops.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer BufQ   { float q[]; };
+layout(set = 0, binding = 1) buffer BufK   { float k_cache[]; };
+layout(set = 0, binding = 2) buffer BufOut { float out_dbg[]; };
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    out_dbg[t]        = q[t];
+    out_dbg[128 + t]  = k_cache[t];
+}

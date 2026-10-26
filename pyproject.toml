@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybridagent-vulkan"
+version = "0.1.0"
+description = "HybridAgent PyTorch inference with Vulkan GPU acceleration and CPU/GPU offloading"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.6",
+  "transformers>=4.56",
+  "numpy",
+  "tqdm",
+]
+
+[tool.setuptools]
+packages = ["backend"]
+
+[tool.setuptools.package-data]
+backend = ["*.py"]

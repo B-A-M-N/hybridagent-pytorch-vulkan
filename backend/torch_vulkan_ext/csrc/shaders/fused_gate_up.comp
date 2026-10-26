@@ -1,0 +1,59 @@
+#version 450
+// Fused SwiGLU MLP block (Qwen3 MLP layout):
+//   gate = A[M,K] @ Wg[K,N]
+//   up   = A[M,K] @ Wu[K,N]
+//   C[M,N] = silu(gate) * up
+// Wg and Wu are stacked as one [K, 2N] weight so a single dispatch does both
+// projections, avoiding two round trips through HBM.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) buffer BufA  { float a[]; };
+layout(set = 0, binding = 1) buffer BufW  { float w[]; };
+layout(set = 0, binding = 2) buffer BufC  { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;      // per-branch output width (gate width == up width)
+} params;
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+
+void main() {
+    // The host flattens every dispatch to 1-D (`vkCmdDispatch(cmd_, gx*gy*gz, 1, 1)`),
+    // so gl_GlobalInvocationID.y is ALWAYS 0 and cannot give the row. The grid
+    // is (tiles_x, tiles_y) with a 16x16 local size, so the flat workgroup
+    // index is wg = tile_y * tiles_x + tile_x and the global thread index is
+    // gid = wg * 256 + local. Recover (row, col) from that.
+    uint wg   = gl_WorkGroupID.x;
+    uint tiles_x = (params.N + 15u) / 16u;
+    uint tile_x = wg % tiles_x;
+    uint tile_y = wg / tiles_x;
+    uint col = tile_x * 16u + gl_LocalInvocationID.x;
+    uint row = tile_y * 16u + gl_LocalInvocationID.y;
+    if (row >= params.M || col >= params.N) return;
+
+    float g = 0.0;
+    float u = 0.0;
+    uint k = 0;
+    for (; k + 4 <= params.K; k += 4) {
+        float a0 = a[row * params.K + k + 0];
+        float a1 = a[row * params.K + k + 1];
+        float a2 = a[row * params.K + k + 2];
+        float a3 = a[row * params.K + k + 3];
+        g += a0 * w[(k + 0) * 2u * params.N + col];
+        u += a0 * w[(k + 0) * 2u * params.N + params.N + col];
+        g += a1 * w[(k + 1) * 2u * params.N + col];
+        u += a1 * w[(k + 1) * 2u * params.N + params.N + col];
+        g += a2 * w[(k + 2) * 2u * params.N + col];
+        u += a2 * w[(k + 2) * 2u * params.N + params.N + col];
+        g += a3 * w[(k + 3) * 2u * params.N + col];
+        u += a3 * w[(k + 3) * 2u * params.N + params.N + col];
+    }
+    for (; k < params.K; k++) {
+        float av = a[row * params.K + k];
+        g += av * w[k * 2u * params.N + col];
+        u += av * w[k * 2u * params.N + params.N + col];
+    }
+    c[row * params.N + col] = silu(g) * u;
+}

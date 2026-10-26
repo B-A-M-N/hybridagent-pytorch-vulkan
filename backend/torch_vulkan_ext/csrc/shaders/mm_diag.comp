@@ -1,0 +1,28 @@
+#version 450
+// Diagnostic: dump exactly what each tile thread computes.
+// A[2,2] = [[1,2],[3,4]], W[2,2] = [[5,6],[7,8]] -> C = A@W.T
+// Thread (lx=0, ly=0) owns C[0,0] and should accumulate sA[0][0]*sW[0][0]
+// plus sA[0][1]*sW[0][1] = 1*5 + 2*6 = 17.
+// Thread (lx=1, ly=0) owns C[0,1] and should get 1*7 + 2*8 = 23.
+layout(local_size_x = 2, local_size_y = 2) in;
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding =  1) buffer BufW { float w[]; };
+layout(set = 0, binding = 2) buffer BufDbg { float dbg[]; };
+layout(push_constant) uniform P { uint M; uint K; uint N; } params;
+shared float sA[2][2];
+shared float sW[2][2];
+void main() {
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    // thread (ly, lx) stages sA[ly][lx] and sW[ly][lx]
+    sA[ly][lx] = a[ly * params.K + lx];
+    sW[ly][lx] = w[ly * params.K + lx];
+    barrier();
+    uint tid = ly * 2u + lx;
+    dbg[tid * 6u + 0u] = sA[ly][lx];
+    dbg[tid * 6u + 1u] = sW[ly][lx];
+    dbg[tid * 6u + 2u] = sA[ly][0];
+    dbg[tid * 6u + 3u] = sA[ly][1];
+    dbg[tid * 6u + 4u] = sW[lx][0];
+    dbg[tid * 6u + 5u] = sW[lx][1];
+}

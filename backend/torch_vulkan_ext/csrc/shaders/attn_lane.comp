@@ -1,0 +1,56 @@
+#version 450
+// Isolate the dot-product accumulation from the write pattern.
+//
+// attn_min.comp writes from lane 0 only (`if (t == 0)`). This variant writes
+// from EVERY lane, so if the value is correct but the write is lost we will see
+// it. It also writes the per-lane partial sums so we can see whether the inner
+// loop is executing at all.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer BufQ   { float q[]; };
+layout(set = 0, binding = 1) buffer BufK   { float k_cache[]; };
+layout(set = 0, binding = 2) buffer BufOut { float out_dbg[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_start;
+    uint seq_len;
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint cap;
+    uint n_q;
+    float scaling;
+} params;
+
+void main() {
+    uint wg    = gl_WorkGroupID.x;
+    uint batch = wg / params.n_heads;
+    uint h     = wg - batch * params.n_heads;
+    uint t     = gl_LocalInvocationID.x;
+
+    uint S    = params.seq_len;
+    uint hd   = params.head_dim;
+    uint hpk  = params.heads_per_kv;
+    uint nkv  = params.n_heads / hpk;
+    uint kv_h = h / hpk;
+    uint nq   = params.n_q;
+
+    uint q_base = (batch * params.n_heads + h) * nq * hd;
+    uint k_base = (batch * nkv + kv_h) * params.cap * hd;
+
+    if (hd != 128) return;
+
+    for (uint s = 0; s < nq; s++) {
+        uint qptr = q_base + s * hd;
+        for (uint m = 0; m < S; m++) {
+            uint kptr = k_base + (params.seq_start + m) * hd;
+            // Each lane reads ONE element (lane t -> dimension t) and writes it.
+            // If the buffers are uploaded correctly this reproduces the input.
+            float qv = q[qptr + t];
+            float kv = k_cache[kptr + t];
+            uint slot = ((batch * params.n_heads + h) * nq + s) * S + m;
+            // slot layout: [NH*nq*S, 128] -> per (row,key) 128 lanes
+            out_dbg[((batch * params.n_heads + h) * nq + s) * S * 128 + m * 128 + t] = qv * kv;
+        }
+    }
+}

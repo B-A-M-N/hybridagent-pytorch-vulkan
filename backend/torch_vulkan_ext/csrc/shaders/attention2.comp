@@ -1,0 +1,130 @@
+#version 450
+// Batched GQA attention over a sequence window.
+//
+//   q:       [batch, n_heads, n_q, head_dim]
+//   k_cache: [batch, n_kv_heads, cap, head_dim]
+//   v_cache: [batch, n_kv_heads, cap, head_dim]
+//   mask:    [batch, n_heads, n_q, seq_len]  additive (0 = attend, -inf = skip)
+//   probs:   [batch, n_heads, n_q, seq_len]  scratch; carries the weights
+//   out:     [batch, n_heads, n_q, head_dim]
+//
+// One workgroup per (batch, q_head), WG_SIZE threads, used only with
+// head_dim == WG_SIZE (128), so lane t owns output column t.
+//
+// Each lane computes the softmax weights for EVERY query row itself and
+// accumulates its own output column. No lane reads another lane's data and no
+// intermediate is published through shared or device memory, so there is no
+// ordering hazard to get right. This replaced a two-phase version that wrote
+// weights to a scratch buffer and read them back; that form produced correct
+// output for some heads and wrong output for others depending on the sequence
+// length, which is the signature of an unsatisfied memory dependency.
+//
+// NO FIXED-SIZE SCORE ARRAY
+// -------------------------
+// An earlier version kept `float scores[MAX_S]` in registers, which capped the
+// sequence length at MAX_S = 512. That made the kernel unusable for real
+// workloads: the HybridAgent system prompt alone is 529 tokens. This version
+// makes TWO passes over the keys -- one to find the row max, one to accumulate
+// the weighted values -- so the per-lane working set is O(1) and the sequence
+// length is bounded only by the buffer size and the model's max position
+// (32768 for this checkpoint).
+//
+// The scores are recomputed identically in both passes; the only state carried
+// between them is the scalar `row_max`.
+#define WG_SIZE 128
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufQ    { float q[]; };
+layout(set = 0, binding = 1) buffer BufK    { float k_cache[]; };
+layout(set = 0, binding = 2) buffer BufV    { float v_cache[]; };
+layout(set = 0, binding = 3) buffer BufMask { float mask[]; };
+layout(set = 0, binding = 4) buffer BufP    { float probs[]; };
+layout(set = 0, binding = 5) buffer BufOut  { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_start;
+    uint seq_len;     // key/value window length
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint cap;
+    uint n_q;         // number of query positions per head
+    float scaling;
+} params;
+
+void main() {
+    // The host flattens the grid to 1-D (see vkCmdDispatch in vk_backend.cpp),
+    // so the workgroup index is a flat counter and each shader derives its own
+    // 2-D coordinates.
+    uint wg    = gl_WorkGroupID.x;
+    uint batch = wg / params.n_heads;
+    uint h     = wg - batch * params.n_heads;
+    uint t     = gl_LocalInvocationID.x;
+
+    uint S    = params.seq_len;      // cache window (number of key/value slots)
+    uint hd   = params.head_dim;
+    uint hpk  = params.heads_per_kv;
+    uint nkv  = params.n_heads / hpk;
+    uint kv_h = h / hpk;
+
+    // q holds `n_q` query positions per head. The head stride is therefore
+    // n_q * hd, NOT seq_len * hd -- seq_len is the key/value window, which is a
+    // different quantity. Mixing them up makes every head after the first read
+    // out of its own block.
+    uint nq = params.n_q;
+
+    uint q_base    = (batch * params.n_heads + h) * nq * hd;
+    uint k_base    = (batch * nkv + kv_h) * params.cap * hd;
+    uint mask_base = (batch * params.n_heads + h) * nq * S;
+    uint p_base    = (batch * params.n_heads + h) * nq * S;
+    uint out_base  = (batch * params.n_heads + h) * nq * hd;
+
+    if (hd != WG_SIZE) return;          // this kernel assumes lane == column
+
+    // Lane t: for every query row s, compute the softmax weights over the
+    // window and immediately accumulate out[s, t].
+    for (uint s = 0; s < nq; s++) {
+        uint qptr = q_base + s * hd;
+
+        // ---- pass 1: row max of the masked, scaled scores
+        float row_max = -3.4e38;
+        for (uint m = 0; m < S; m++) {
+            uint kptr = k_base + (params.seq_start + m) * hd;
+            float sc = 0.0;
+            for (uint d = 0; d < hd; d++) {
+                sc += q[qptr + d] * k_cache[kptr + d];
+            }
+            row_max = max(row_max,
+                          sc * params.scaling + mask[mask_base + s * S + m]);
+        }
+
+        // ---- pass 2: normalisation denominator
+        float sum = 0.0;
+        for (uint m = 0; m < S; m++) {
+            uint kptr = k_base + (params.seq_start + m) * hd;
+            float sc = 0.0;
+            for (uint d = 0; d < hd; d++) {
+                sc += q[qptr + d] * k_cache[kptr + d];
+            }
+            sum += exp(sc * params.scaling + mask[mask_base + s * S + m]
+                       - row_max);
+        }
+        float inv = (sum > 0.0) ? 1.0 / sum : 0.0;
+
+        // ---- pass 3: normalised weights and this lane's output column
+        float acc = 0.0;
+        for (uint m = 0; m < S; m++) {
+            uint kptr = k_base + (params.seq_start + m) * hd;
+            float sc = 0.0;
+            for (uint d = 0; d < hd; d++) {
+                sc += q[qptr + d] * k_cache[kptr + d];
+            }
+            float p = exp(sc * params.scaling + mask[mask_base + s * S + m]
+                          - row_max) * inv;
+            probs[p_base + s * S + m] = p;   // for inspection by the tests
+            acc += p * v_cache[k_base + (params.seq_start + m) * hd + t];
+        }
+        out_data[out_base + s * hd + t] = acc;
+    }
+}

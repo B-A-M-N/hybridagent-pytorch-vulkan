@@ -1,0 +1,32 @@
+#version 450
+// Qwen3 RoPE: interleaved pairing with rotate-half on x[2i], x[2i+1].
+//   q_embed = q * cos + rotate_half(q) * sin
+//   rotate_half(x) = cat(-x2, x1)  with x1 = x[0:HD/2], x2 = x[HD/2:HD]
+// theta_i = 1000000 ** (-2i / head_dim), i in [0, head_dim/2)
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer BufData { float data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint offset;      // element offset of this head's row
+    uint head_dim;    // 128
+    uint pos;         // RoPE position id
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint nhalf = params.head_dim / 2u;
+    if (gid >= nhalf) return;
+
+    float theta = pow(1000000.0, -2.0 * float(gid) / float(params.head_dim));
+    float angle = float(params.pos) * theta;
+    float c = cos(angle);
+    float s = sin(angle);
+
+    uint base = params.offset;
+    float x0 = data[base + gid];
+    float x1 = data[base + gid + nhalf];
+
+    data[base + gid]     = x0 * c - x1 * s;
+    data[base + gid + nhalf] = x1 * c + x0 * s;
+}

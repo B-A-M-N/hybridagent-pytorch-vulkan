@@ -1,0 +1,57 @@
+#version 450
+// LayerNorm with bias: out[i] = (x[i]-mean)/sqrt(var+eps) * w[i] + b[i]
+// Matches torch.nn.functional.layer_norm (biased variance, eps inside sqrt).
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufIn    { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufW     { float weight[]; };
+layout(set = 0, binding = 2) buffer BufB     { float bias[]; };
+layout(set = 0, binding = 3) buffer BufOut   { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_rows;
+    uint row_size;
+    float eps;
+} params;
+
+shared float s_sum[WG_SIZE];
+shared float s_sq[WG_SIZE];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= params.num_rows) return;
+
+    uint base = row * params.row_size;
+
+    float sum = 0.0;
+    for (uint i = tid; i < params.row_size; i += WG_SIZE) sum += in_data[base + i];
+    s_sum[tid] = sum;
+    barrier();
+    for (uint s = WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        barrier();
+    }
+    float mean = s_sum[0] / float(params.row_size);
+    barrier();
+
+    float sq = 0.0;
+    for (uint i = tid; i < params.row_size; i += WG_SIZE) {
+        float d = in_data[base + i] - mean;
+        sq += d * d;
+    }
+    s_sq[tid] = sq;
+    barrier();
+    for (uint s = WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) s_sq[tid] += s_sq[tid + s];
+        barrier();
+    }
+    float inv = inversesqrt(s_sq[0] / float(params.row_size) + params.eps);
+    barrier();
+
+    for (uint i = tid; i < params.row_size; i += WG_SIZE) {
+        out_data[base + i] = (in_data[base + i] - mean) * inv * weight[i] + bias[i];
+    }
+}

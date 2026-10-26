@@ -1,0 +1,59 @@
+#version 450
+// MINIMAL attention score kernel -- no local array, no softmax, no V.
+//
+// Purpose: isolate whether the `scores[MAX_S]` local array in attention2.comp
+// is being mis-compiled by RADV. This kernel computes ONLY the raw dot product
+// q.k for each (head, row, key) and writes it out. No array, no exp, no mask.
+//
+// If this kernel is correct while attention2 is not, the defect is in the
+// local-array / softmax structure, not in the addressing or the dot product.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer BufQ   { float q[]; };
+layout(set = 0, binding = 1) buffer BufK   { float k_cache[]; };
+layout(set = 0, binding = 2) buffer BufOut { float out_dbg[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_start;
+    uint seq_len;
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint cap;
+    uint n_q;
+    float scaling;
+} params;
+
+void main() {
+    uint wg    = gl_WorkGroupID.x;
+    uint batch = wg / params.n_heads;
+    uint h     = wg - batch * params.n_heads;
+    uint t     = gl_LocalInvocationID.x;
+
+    uint S    = params.seq_len;
+    uint hd   = params.head_dim;
+    uint hpk  = params.heads_per_kv;
+    uint nkv  = params.n_heads / hpk;
+    uint kv_h = h / hpk;
+    uint nq   = params.n_q;
+
+    uint q_base = (batch * params.n_heads + h) * nq * hd;
+    uint k_base = (batch * nkv + kv_h) * params.cap * hd;
+
+    if (hd != 128) return;
+
+    for (uint s = 0; s < nq; s++) {
+        uint qptr = q_base + s * hd;
+        for (uint m = 0; m < S; m++) {
+            uint kptr = k_base + (params.seq_start + m) * hd;
+            float sc = 0.0;
+            for (uint d = 0; d < hd; d++) {
+                sc += q[qptr + d] * k_cache[kptr + d];
+            }
+            if (t == 0) {
+                uint slot = ((batch * params.n_heads + h) * nq + s) * S + m;
+                out_dbg[slot] = sc;
+            }
+        }
+    }
+}

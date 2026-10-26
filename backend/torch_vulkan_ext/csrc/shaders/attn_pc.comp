@@ -1,0 +1,37 @@
+#version 450
+// Dump the push constants and derived bases the shader actually sees.
+// If these differ from the host's intent, the push-constant layout is wrong.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer BufOut { float out_dbg[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_start;
+    uint seq_len;
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint cap;
+    uint n_q;
+    float scaling;
+} params;
+
+void main() {
+    if (gl_WorkGroupID.x != 0) return;
+    if (gl_LocalInvocationID.x != 0) return;
+    out_dbg[0]  = float(params.seq_start);
+    out_dbg[1]  = float(params.seq_len);
+    out_dbg[2]  = float(params.n_heads);
+    out_dbg[3]  = float(params.heads_per_kv);
+    out_dbg[4]  = float(params.head_dim);
+    out_dbg[5]  = float(params.cap);
+    out_dbg[6]  = float(params.n_q);
+    out_dbg[7]  = float(params.scaling);
+    uint nkv = params.n_heads / params.heads_per_kv;
+    out_dbg[8]  = float(nkv);
+    out_dbg[9]  = float(params.n_heads / params.heads_per_kv);
+    // derived bases for batch 0, head 0
+    out_dbg[10] = float((0u * params.n_heads + 0u) * params.n_q * params.head_dim);
+    out_dbg[11] = float((0u * nkv + 0u) * params.cap * params.head_dim);
+    out_dbg[12] = float((0u * params.n_heads + 0u) * params.n_q * params.seq_len);
+}

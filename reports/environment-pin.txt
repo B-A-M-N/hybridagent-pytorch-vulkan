@@ -1,0 +1,73 @@
+# Environment pin -- 2026-10-26T00:31:05Z
+
+## Host
+hostname: pop-os
+kernel:   7.1.1-76070101-generic
+os:       Pop!_OS 22.04 LTS
+
+## CPU
+AMD Ryzen 9 5900X 12-Core Processor
+threads:  24
+
+## Memory
+               total        used        free      shared  buff/cache   available
+Mem:            31Gi        11Gi       4.2Gi        51Mi        15Gi        17Gi
+
+## GPU / driver
+	apiVersion         = 1.4.311
+	deviceName         = AMD Radeon RX 6600 XT (RADV NAVI23)
+	driverName         = radv
+	driverInfo         = Mesa 25.1.5-1pop0~1756399231~22.04~b84bab8
+
+## Python
+Python 3.11.15
+
+## Python packages (pinned)
+accelerate==1.14.0
+numpy==2.4.6
+safetensors==0.8.0
+tokenizers==0.22.2
+torch==2.12.0+cpu
+transformers==5.13.0
+
+## Model checkpoint
+total 16070120
+drwxrwxr-x 3 bamn bamn        4096 Oct 21 15:45 .
+drwxrwxr-x 3 bamn bamn        4096 Oct 21 15:38 ..
+model_type: qwen3
+architectures: ['Qwen3ForCausalLM']
+num_hidden_layers: 36
+hidden_size: 4096
+rope_parameters: {'rope_theta': 1000000, 'rope_type': 'default'}
+max_position_embeddings: 32768
+
+## Shader hashes (sha256)
+750c3bd4f2b8d7f982e826b6c8b6d16ef7db2fd37cdaf7398e26d180c6dcf0e3  argmax_rows.spv
+dcef67be52caf66c8b98814398611fcf9ff20f7922448b5c0a2c364c83ab693d  argmax.spv
+a2c99af6972f2263a86de4e6d7211e204d1091f6ec88c03702bce5c4c36c765f  attention2.spv
+11bcfa3c2b19e590161d759c802d9e90275beda9a22106ce899ebe2e747ec755  attn_dbg.spv
+7425a30bf07f33bc45f42c222c2578d780d1bd52d55afa1c93b4c7f2f2a3111a  attn_lane.spv
+022360dba4f63a45112568fa07b2308019ba822c4e6ba29dd708bd182555187f  attn_min.spv
+227f734a4705d3bfc7b602256260d6f201f2f51c9b4fd7d2540cec84e0f27981  attn_pc.spv
+01cd6b9b0f4d13ceb41554c9e2ae4c053d3e756777fc5bfd91ee2d7556dd652e  attn_rb.spv
+2bc8d595eca3799fa811ad40cff94795beb06772ea23e5f806b2f24a2f2b662d  broadcast_add.spv
+93ab597b14bd99b546a357d2c1f70a533783ba5ccbc2ff891b8a97d16cc1f3d7  fused_gate_up.spv
+73ce3724b6acd0eb4eaa547a0058efde4462f7bb1b17e2ed0d06ddf36857180f  gather.spv
+44b65886074b06b1130765a3694765cce1308da966ccdcf89e5018dc11e44d48  gelu_erf.spv
+cdeb49265a5d820c2d74d6a88e7a869390c7b65b9e048d5827cbdcdedf6c74d9  kv_append.spv
+6ea00e751e47cbc636c23dd0888e4f5198642318ee21885bf4a51f46e6b453b5  layernorm.spv
+94889eecae09bc77822967aa5f8b48be312217abd534512537c2e99b08c7386a  matmul.spv
+090444d28fa0c5554dc0d13de5a5e2c10f93797b8b83a1ca32e0523bd3dfdf0a  matmul_t_bias.spv
+a4a86e584b87326c16297957f5b1a050642be87b125e9cd904e1849aa5d2a75b  mm_diag.spv
+01cd6b9b0f4d13ceb41554c9e2ae4c053d3e756777fc5bfd91ee2d7556dd652e  rb_128.spv
+d9a484f78e6f5ffd3de5074f9b414245a898231be85a8ce042ae0a6509b14b0d  rb_256.spv
+4f7b9f2efd31f5de0407eed8dbdff5a0f0077e68389053715a26b7507b5795c3  rb_64.spv
+ac7023e3b281b4ce45fdd5667d764082365336fa0cdc1035c218b326eae14a22  residual_add.spv
+0b804fd1c18aea03c8dc9e8fd02f9567af150e513515b83aee0b8fefb933a5fa  rmsnorm.spv
+dcdd3bc4eab3dc42b390cd8dd62e9adb0639fa63a9705d2b5b34d1612b5f2792  rope_qkv.spv
+68bb76cf5b63d10216debbc9e0be78c535d3741c06cb21572bee297e93ba1e95  rope.spv
+358458931785df84e16f2b3e6024301f3a7bed3e0817eaae8805688dde0f8c0b  silu_gate.spv
+a5af06e94670c8520f6d37c3b5a5fab3087d8e1a5f7a8e08adeb459e1659b365  slice.spv
+
+## Extension library
+9ed2a81b5f48aa4f9655063c9cfbc0700d059fa95dd60ffd4b2e9f06d0ff79c9  backend/torch_vulkan_ext/lib/tvkvk.so

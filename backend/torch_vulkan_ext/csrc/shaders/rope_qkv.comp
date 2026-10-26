@@ -1,0 +1,69 @@
+#version 450
+// RoPE on a packed [Q | K | V] buffer, in place.
+//   Q: [S, n_heads, head_dim]
+//   K: [S, n_kv_heads, head_dim]   (at offset S * q_len)
+//   V: [S, n_kv_heads, head_dim]   (untouched)
+//
+// Qwen3 uses the interleaved pairing with rotate-half:
+//   x[i], x[i + head_dim/2] rotated together by theta_i * pos
+//   theta_i = 1000000 ** (-2i / head_dim)
+//
+// Two things the token count affects:
+//   * the stride between heads is S*head_dim, not head_dim;
+//   * each token has its OWN position. `pos_start` is the absolute position of
+//     token 0, so token t is rotated by (pos_start + t).
+// Passing a single position for the whole buffer silently mis-rotates every
+// token after the first, which is invisible in decode (S == 1) but wrong for a
+// prefill.
+//
+// This is a separate dispatch from the cache store on purpose: a Vulkan
+// `barrier()` only synchronises threads *within one workgroup*, so a fused
+// "RoPE then write the cache" kernel that relies on cross-workgroup ordering
+// produces stale cache writes.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer BufQKV { float qkv[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint pos_start;  // absolute position of token 0
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint q_len;      // n_heads * head_dim      (per-token Q size)
+    uint kv_len;     // n_kv_heads * head_dim    (per-token KV size)
+    uint n_tok;      // number of tokens packed in the buffer
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint hd = params.head_dim;
+    uint nhalf = hd / 2u;
+
+    uint total_heads = params.n_heads + params.n_kv_heads;
+    uint units = params.n_tok * total_heads * nhalf;
+    if (gid >= units) return;
+
+    uint pair = gid % nhalf;
+    uint rest = gid / nhalf;
+    uint head = rest % total_heads;
+    uint tok = rest / total_heads;
+
+    uint q_region = params.n_tok * params.q_len;
+    uint base;
+    if (head < params.n_heads) {
+        base = tok * params.q_len + head * hd;
+    } else {
+        base = q_region + tok * params.kv_len + (head - params.n_heads) * hd;
+    }
+
+    float theta = pow(1000000.0, -2.0 * float(pair) / float(hd));
+    float angle = float(params.pos_start + tok) * theta;
+    float c = cos(angle);
+    float s = sin(angle);
+
+    uint b = base;
+    float x0 = qkv[b + pair];
+    float x1 = qkv[b + pair + nhalf];
+    qkv[b + pair]         = x0 * c - x1 * s;
+    qkv[b + pair + nhalf] = x1 * c + x0 * s;
+}

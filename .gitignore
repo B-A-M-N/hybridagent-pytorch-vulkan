@@ -1,0 +1,26 @@
+# --- large / regenerable artifacts ---
+weights/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# third_party: vendored upstream sources (HybridAgent, kompute, torch-vulkan)
+# Reproducible via scripts/install.sh -- do not vendor 188MB into git.
+third_party/
+
+# build outputs -- regenerable with `make -C backend/torch_vulkan_ext/build`
+backend/torch_vulkan_ext/build/
+backend/torch_vulkan_ext/lib/*.so
+
+# SPIR-V binaries are regenerable from the .comp sources via compile.sh.
+# The .comp sources ARE committed; the .spv are not (see scripts/verify-backend.sh
+# which rebuilds and hashes them).
+backend/torch_vulkan_ext/csrc/shaders/*.spv
+
+# runtime artifacts
+logs/
+*.log
+benchmarks/*.json
+benchmarks/*.csv
+reports/*.html

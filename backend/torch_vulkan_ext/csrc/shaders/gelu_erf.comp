@@ -1,0 +1,31 @@
+#version 450
+// GELU (erf / "none" approximation) to match torch.nn.GELU() default.
+//   y = 0.5 * x * (1 + erf(x / sqrt(2)))
+// erf() needs the GLSL extension for the standard math library.
+#extension GL_EXT_shader_implicit_conversions : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufIn  { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants { uint num_elements; } params;
+
+// Abramowitz & Stegun 7.1.26 -- |eps| <= 1.5e-7, far tighter than the
+// tanh approximation torch-vulkan's `gelu` uses (~1e-3).
+float erf_approx(float x) {
+    float sign = (x >= 0.0) ? 1.0 : -1.0;
+    float ax = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * ax);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                      - 0.284496736) * t + 0.254829592) * t * exp(-ax * ax);
+    return sign * y;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.num_elements) return;
+    float x = in_data[gid];
+    out_data[gid] = 0.5 * x * (1.0 + erf_approx(x * 0.70710678118654752440));
+}

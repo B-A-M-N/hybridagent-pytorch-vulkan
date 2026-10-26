@@ -1,0 +1,173 @@
+"""
+Stage 1 capability gate (CPU reference, no Vulkan): does the original
+HybridAgent checkpoint actually perform a coding task?
+
+This runs the *original, unmodified* engine on CPU. It answers the question that
+gates the whole project: whether the model's trained tool behaviour
+(`<python>` / `<search>` / `<answer>`) generalises to repository-level work.
+
+The task is deliberately small and deterministic: a repository with a failing
+test, and the instruction to diagnose and fix it. Success criteria:
+  1. the model emits a `<python>` action (real tool use, not just prose)
+  2. the generated Python is valid and runnable
+  3. it runs the test suite and reports a real traceback
+  4. it edits the source file
+  5. it re-runs the tests and they pass
+
+Usage:  .venv/bin/python tests/stage1_cpu_coding.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+import torch
+
+ROOT = "/home/bamn/ai-experiments/hybridagent-pytorch-vulkan"
+sys.path.insert(0, os.path.join(ROOT, "third_party", "HybridAgent"))
+
+from hybrid_agent import (  # noqa: E402
+    SYSTEM_PROMPT, HybridGenerationEngine, ToolExecutor, load_hybrid_agent,
+)
+from hybrid_agent.tools import build_tool_executor  # noqa: E402
+
+MODEL_DIR = os.path.join(ROOT, "weights", "HybridAgent-8B-Agentic")
+
+CODING_PROMPT = """You are a software engineer working in a Python repository.
+
+Use the <python> tool to inspect files, run commands, and modify the repository.
+The code you write is executed and its output is returned to you in <result>.
+
+Repository layout:
+  src/calculator.py   -- functions add, subtract, multiply, divide, is_prime
+  tests/test_calculator.py -- pytest tests for those functions
+
+One test is failing. Diagnose why, fix src/calculator.py, then run the test
+suite again to confirm it passes.
+
+Report your final answer as <answer>\\boxed{...}</answer>."""
+
+
+class RecordingToolExecutor:
+    """Wraps the tool executor and records every action for verification."""
+
+    def __init__(self, python_timeout: int = 60, **kw):
+        self._inner = build_tool_executor(
+            python_timeout=python_timeout, require_search=False, **kw)
+        self.calls: list[tuple[str, str]] = []
+
+    def execute(self, tag: str, content: str, **kw) -> str:
+        self.calls.append((tag, content))
+        print(f"\n  [TOOL {tag}] {content[:300]}", flush=True)
+        return self._inner.execute(tag, content, **kw)
+
+    def get_tool(self, tag):
+        return self._inner.get_tool(tag)
+
+    def identify_tool(self, text):
+        return self._inner.identify_tool(text)
+
+    @staticmethod
+    def extract_content(text, tag):
+        return ToolExecutor.extract_content(text, tag)
+
+
+def main() -> int:
+    torch.manual_seed(0)
+    print("loading HybridAgent-8B (CPU, bf16) ...", flush=True)
+    t0 = time.time()
+    model, tok = load_hybrid_agent(MODEL_DIR, dtype=torch.bfloat16, device="cpu")
+    print(f"loaded in {time.time()-t0:.1f}s\n", flush=True)
+
+    tools = RecordingToolExecutor(python_timeout=60)
+
+    engine = HybridGenerationEngine(
+        model, tok, torch.device("cpu"), tools,
+        system_prompt=CODING_PROMPT,
+        question="A test in tests/test_calculator.py is failing. Find out why, "
+                 "fix src/calculator.py, and confirm the tests pass.",
+        batch_size=1,
+        max_response_tokens=1200,
+        max_tool_calls=6,
+        max_search_calls=0,
+        max_python_calls=6,
+        terminate_on_tool_cap=True,
+        max_turns=12,
+        temperature=0.3,
+        top_p=0.95,
+        top_k=20,
+        repetition_penalty=1.0,
+        min_latent_steps=4,
+        max_latent_steps=60,
+        record_latent_readout=True,
+    )
+
+    t1 = time.time()
+    engine.run(torch.Generator(device="cpu").manual_seed(0))
+    wall = time.time() - t1
+
+    row = engine.rows[0]
+    result = engine.row_result(row)
+
+    print("\n" + "=" * 70)
+    print("STAGE 1 CPU CODING TEST")
+    print("=" * 70)
+    print(f"wall time        : {wall:.1f}s")
+    print(f"text tokens      : {result['generation_steps'] - result['latent_steps']}")
+    print(f"latent steps     : {result['latent_steps']}")
+    print(f"latent spans     : {result['latent_spans']}")
+    print(f"anchor exits     : {result['anchor_exits']}")
+    print(f"forced exits     : {result['forced_exits']}")
+    print(f"python calls     : {result['python_calls']}")
+    print(f"search calls     : {result['search_calls']}")
+    print(f"turns            : {result['turns']}")
+    print(f"end reason       : {result['end_reason']}")
+
+    # ---- verification -------------------------------------------------
+    checks = []
+
+    def chk(name, ok, detail=""):
+        checks.append((name, ok, detail))
+        print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+
+    chk("model used the <python> tool",
+        result["python_calls"] > 0,
+        f"({result['python_calls']} calls)")
+
+    # did any generated python actually run the test suite?
+    ran_tests = any("pytest" in c or "python -m pytest" in c
+                    for _, c in tools.calls)
+    chk("issued a test-execution command", ran_tests)
+
+    # did it edit the file?
+    edited = any("calculator" in c and ("write" in c.lower() or "open(" in c)
+                 for _, c in tools.calls)
+    chk("attempted a source edit", edited)
+
+    # genuine latent reasoning
+    chk("genuine latent reasoning", result["latent_steps"] > 0,
+        f"({result['latent_steps']} latent steps)")
+
+    # final answer present
+    out = result["output"]
+    chk("produced a final answer", "<answer>" in out)
+
+    print("\n--- output (first 1500 chars) ---")
+    print(out[:1500])
+    print("--- end ---\n")
+
+    if result.get("latent_readouts"):
+        print("--- latent span pseudo-text ---")
+        for span in result["latent_readouts"][:3]:
+            print(f"  span: steps={span['steps']} exit={span['exit']}")
+            print(f"  pseudo: {span['pseudo_text'][:200]!r}")
+        print()
+
+    n_fail = sum(1 for _, ok, _ in checks if not ok)
+    print(f"{len(checks) - n_fail}/{len(checks)} capability checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

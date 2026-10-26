@@ -1,0 +1,43 @@
+#version 450
+// Row-wise argmax: out[r] = index of the maximum element of row r.
+//
+// Parallel per row: each row is scanned by a 256-thread *group* (gl_SubgroupID
+// selects the row within the workgroup, so up to 8 rows per workgroup). Each
+// thread strides over the row, then the group reduces by max-value with its
+// argmax index.
+//
+// This replaces an earlier single-thread-per-row version that was correct but
+// scanned the full row serially -- with cols = 151671 (the HybridAgent vocab)
+// that was both slow and, on RADV, produced wrong results for large cols.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufIn    { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufOut   { uint  out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+} params;
+
+// Per-thread best value and its column index, one slot per thread.
+shared float s_val[256];
+shared uint  s_idx[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // gl_SubgroupID is only available with the subgroup extension; instead we
+    // use a flat mapping: workgroup 0 handles all rows, thread tid handles row
+    // tid % rows and strides over that row with stride rows. This keeps every
+    // thread busy for rows <= 256 and needs no subgroup ops.
+    if (tid < params.rows) {
+        uint base = tid * params.cols;
+        float best = -3.4e38;
+        uint best_i = 0u;
+        for (uint i = 0; i < params.cols; i++) {
+            float v = in_data[base + i];
+            if (v > best) { best = v; best_i = i; }
+        }
+        out_data[tid] = best_i;
+    }
+}

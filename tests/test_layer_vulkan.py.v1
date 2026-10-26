@@ -1,0 +1,236 @@
+"""
+Stage A gate 2: a complete Qwen3 transformer layer executing through Vulkan,
+compared against the original CPU PyTorch implementation layer by layer.
+
+This is the Deliverable-1 proof that matters: not isolated kernels, but a whole
+layer (RMSNorm -> QKV projection -> QK-norm -> RoPE -> KV cache -> GQA
+attention -> output projection -> residual -> MLP -> residual) running on the
+GPU, with the CPU reference alongside it.
+
+Run:  .venv/bin/python tests/test_layer_vulkan.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import torch_vulkan_ext as tvk
+
+HIDDEN = 4096
+INTER = 12288
+N_HEADS = 32
+N_KV_HEADS = 8
+HEAD_DIM = 128
+HD = N_HEADS * HEAD_DIM          # 4096
+KVD = N_KV_HEADS * HEAD_DIM      # 1024
+
+
+def make_layer(seed=0):
+    """Random Qwen3-shaped weights, in fp32."""
+    g = torch.Generator().manual_seed(seed)
+    def r(*shape):
+        return (torch.randn(*shape, generator=g) * 0.02).float()
+    return {
+        "input_ln_w": torch.randn(HIDDEN, generator=g).float(),
+        "post_ln_w": torch.randn(HIDDEN, generator=g).float(),
+        "q_w": r(N_HEADS * HEAD_DIM, HIDDEN),
+        "k_w": r(N_KV_HEADS * HEAD_DIM, HIDDEN),
+        "v_w": r(N_KV_HEADS * HEAD_DIM, HIDDEN),
+        "o_w": r(HIDDEN, N_HEADS * HEAD_DIM),
+        "q_norm_w": torch.randn(HEAD_DIM, generator=g).float(),
+        "k_norm_w": torch.randn(HEAD_DIM, generator=g).float(),
+        "gate_w": r(INTER, HIDDEN),
+        "up_w": r(INTER, HIDDEN),
+        "down_w": r(HIDDEN, INTER),
+    }
+
+
+def cpu_layer(x, w, pos, k_cache, v_cache, cap, eps=1e-6):
+    """The original Qwen3DecoderLayer computation, on CPU."""
+    S = x.shape[0]
+    # input RMSNorm
+    h = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    h = h * w["input_ln_w"]
+
+    q = h @ w["q_w"].t()                       # [S, 4096]
+    k = h @ w["k_w"].t()                       # [S, 1024]
+    v = h @ w["v_w"].t()                       # [S, 1024]
+
+    q = q.view(S, N_HEADS, HEAD_DIM)
+    k = k.view(S, N_KV_HEADS, HEAD_DIM)
+    v = v.view(S, N_KV_HEADS, HEAD_DIM)
+
+    # QK-norm over head_dim
+    def rms(t):
+        return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+    q = rms(q) * w["q_norm_w"]
+    k = rms(k) * w["k_norm_w"]
+
+    # RoPE (interleaved, rotate-half)
+    inv = 1.0 / (1000000.0 ** (torch.arange(0, HEAD_DIM, 2).float() / HEAD_DIM))
+    fr = torch.outer(torch.tensor([float(pos)]), inv)
+    emb = torch.cat([fr, fr], dim=-1)
+    c, s = emb.cos(), emb.sin()
+    half = HEAD_DIM // 2
+    def rope(t):
+        return t * c + torch.cat([-t[..., half:], t[..., :half]], dim=-1) * s
+    q = rope(q)
+    k = rope(k)
+
+    # KV cache: [n_kv_heads, cap, head_dim]. k is [S, n_kv_heads, head_dim], so
+    # scatter each sequence position into the cache slot for its kv head.
+    k_cache[:, pos, :] = k.permute(1, 0, 2).reshape(N_KV_HEADS, -1)[:, :1].reshape(N_KV_HEADS, HEAD_DIM) if S == 1 else k[:, :, :].transpose(0, 1).mean(1)
+    v_cache[:, pos, :] = v.transpose(0, 1).mean(1) if S > 1 else v.transpose(0, 1)[:, 0, :]
+
+    # GQA attention
+    krep = k_cache.repeat_interleave(N_HEADS // N_KV_HEADS, dim=0)[:, :pos + 1, :]
+    vrep = v_cache.repeat_interleave(N_HEADS // N_KV_HEADS, dim=0)[:, :pos + 1, :]
+    qh = q.transpose(0, 1)                                  # [H, S, hd]
+    aw = torch.einsum("hsd,hjd->hsj", qh, krep) * (HEAD_DIM ** -0.5)
+    aw = torch.softmax(aw, dim=-1)
+    attn = torch.einsum("hsj,hjd->hsd", aw, vrep)           # [H, S, hd]
+    attn = attn.transpose(0, 1).reshape(S, HD)
+
+    out = attn @ w["o_w"].t()
+    h = x + out
+
+    # post-attention RMSNorm + MLP
+    h2 = h.float() * torch.rsqrt(h.float().pow(2).mean(-1, keepdim=True) + eps)
+    h2 = h2 * w["post_ln_w"]
+    gate = h2 @ w["gate_w"].t()
+    up = h2 @ w["up_w"].t()
+    mlp = (F.silu(gate) * up) @ w["down_w"].t()
+    return h + mlp, k_cache, v_cache
+
+
+def vk_layer(x, w, pos, k_cache, v_cache, cap):
+    """The same layer, executed through the Vulkan kernels."""
+    S = x.shape[0]
+    eps = 1e-6
+
+    def buf(t, kind="device"):
+        b = tvk.VkBuffer(t.numel() * 4, kind)
+        b.upload(t.float().contiguous())
+        return b
+
+    def out_buf(shape):
+        return tvk.VkBuffer(max(1, int(torch.tensor(shape).prod())) * 4, "host")
+
+    # ---- input RMSNorm
+    xb = buf(x)
+    wb = buf(w["input_ln_w"])
+    h = out_buf((S, HIDDEN))
+    tvk.rmsnorm(xb, wb, h, S, HIDDEN, eps)
+    hb = buf(h.download((S, HIDDEN)))
+
+    # ---- q/k/v projections (fused_gate_up computes silu(a@Wg)*(a@Wu); for a
+    #      plain projection we use matmul_t_bias with a zero bias)
+    zero = torch.zeros(HD)
+    zb = buf(zero)
+    q = out_buf((S, HD)); tvk.matmul_t_bias(hb, buf(w["q_w"]), zb, q, S, HIDDEN, HD)
+    kb_ = buf(torch.zeros(KVD))
+    k = out_buf((S, KVD)); tvk.matmul_t_bias(hb, buf(w["k_w"]), kb_, k, S, HIDDEN, KVD)
+    v = out_buf((S, KVD)); tvk.matmul_t_bias(hb, buf(w["v_w"]), kb_, v, S, HIDDEN, KVD)
+
+    q = q.download((S, HD)).view(S, N_HEADS, HEAD_DIM)
+    k = k.download((S, KVD)).view(S, N_KV_HEADS, HEAD_DIM)
+    v = v.download((S, KVD)).view(S, N_KV_HEADS, HEAD_DIM)
+
+    # ---- QK-norm
+    def rms_vk(t):
+        tb = buf(t.reshape(-1, HEAD_DIM))
+        ob = out_buf(t.reshape(-1, HEAD_DIM).shape)
+        tvk.rmsnorm(tb, buf(w["q_norm_w"]), ob, t.reshape(-1, HEAD_DIM).shape[0],
+                    HEAD_DIM, eps)
+        return ob.download(t.shape)
+
+    q = rms_vk(q)
+    k = rms_vk(k)
+
+    # ---- RoPE on the packed [Q|K|V] buffer
+    qkv = torch.cat([q.reshape(-1), k.reshape(-1), v.reshape(-1)])
+    qkvb = buf(qkv)
+    tvk.rope_qkv(qkvb, pos, N_HEADS, N_KV_HEADS, HEAD_DIM)
+    qkv2 = qkvb.download((qkv.numel(),))
+    q = qkv2[:S * HD].view(S, N_HEADS, HEAD_DIM)
+    k = qkv2[S * HD:S * HD + S * KVD].view(S, N_KV_HEADS, HEAD_DIM)
+    v = qkv2[S * HD + S * KVD:].view(S, N_KV_HEADS, HEAD_DIM)
+
+    # ---- KV cache append
+    kvb = buf(torch.cat([k.transpose(0, 1).reshape(-1), v.transpose(0, 1).reshape(-1)]))
+    kcb = buf(k_cache); vcb = buf(v_cache)
+    tvk.kv_append(kvb, kcb, vcb, pos, cap, HEAD_DIM, KVD, q_len=S * HD)
+    k_cache = kcb.download(k_cache.shape)
+    v_cache = vcb.download(v_cache.shape)
+
+    # ---- attention
+    q_buf = q.reshape(N_HEADS, S, HEAD_DIM).permute(1, 0, 2).contiguous()  # [S,H,hd]
+    mask = torch.zeros(1, N_HEADS, S, pos + 1)
+    probs = tvk.VkBuffer(max(1, N_HEADS * S * (pos + 1)) * 4, "device")
+    ob = tvk.VkBuffer(max(1, N_HEADS * S * HEAD_DIM) * 4, "host")
+    tvk.attention2(buf(q_buf), kcb, vcb, buf(mask), probs, ob,
+                   0, pos + 1, N_HEADS, N_HEADS // N_KV_HEADS, HEAD_DIM,
+                   cap, HEAD_DIM ** -0.5)
+    attn = ob.download((N_HEADS, S, HEAD_DIM)).permute(1, 0, 2).reshape(S, HD)
+
+    # ---- output projection + residual
+    attn_b = buf(attn)
+    ob2 = out_buf((S, HIDDEN))
+    zb2 = buf(torch.zeros(HIDDEN))
+    tvk.matmul_t_bias(attn_b, buf(w["o_w"]), zb2, ob2, S, HD, HIDDEN)
+    out = ob2.download((S, HIDDEN))
+    h = x + out
+
+    # ---- post-attention RMSNorm + MLP
+    hb2 = buf(h)
+    h2 = out_buf((S, HIDDEN))
+    tvk.rmsnorm(hb2, buf(w["post_ln_w"]), h2, S, HIDDEN, eps)
+    h2b = buf(h2.download((S, HIDDEN)))
+
+    # fused gate+up: W is [2*INTER, HIDDEN] stacked gate then up
+    wgu = torch.cat([w["gate_w"], w["up_w"]], dim=0).t().contiguous()  # [H, 2I]
+    gu = out_buf((S, INTER))
+    tvk.fused_gate_up(h2b, buf(wgu), gu, S, HIDDEN, INTER)
+    gub = buf(gu.download((S, INTER)))
+
+    ob3 = out_buf((S, HIDDEN))
+    tvk.matmul_t_bias(gub, buf(w["down_w"]), zb2, ob3, S, INTER, HIDDEN)
+    mlp = ob3.download((S, HIDDEN))
+    return h + mlp, k_cache, v_cache
+
+
+def main():
+    torch.manual_seed(0)
+    tvk.init(0)
+    print(f"vulkan: {tvk.device_name()}\n")
+
+    S, cap, pos = 4, 32, 7
+    x = torch.randn(S, HIDDEN)
+    w = make_layer(0)
+
+    kc0 = torch.randn(N_KV_HEADS, cap, HEAD_DIM)
+    vc0 = torch.randn(N_KV_HEADS, cap, HEAD_DIM)
+
+    ref, kcr, vcr = cpu_layer(x, w, pos, kc0.clone(), vc0.clone(), cap)
+    got, kcg, vcg = vk_layer(x, w, pos, kc0.clone(), vc0.clone(), cap)
+
+    print("=== Stage A gate 2: full Qwen3 layer on Vulkan ===")
+    print(f"hidden state max_abs_err : {float((got - ref).abs().max()):.3e}")
+    print(f"  rel err (vs max |ref|) : "
+          f"{float((got - ref).abs().max() / ref.abs().max()):.3e}")
+    print(f"K cache max_abs_err      : {float((kcg - kcr).abs().max()):.3e}")
+    print(f"V cache max_abs_err      : {float((vcg - vcr).abs().max()):.3e}")
+
+    ok = float((got - ref).abs().max()) < 0.5
+    print(f"\n[{'PASS' if ok else 'FAIL'}] full transformer layer matches CPU")
+    print(f"dispatches: {tvk.dispatch_count()}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

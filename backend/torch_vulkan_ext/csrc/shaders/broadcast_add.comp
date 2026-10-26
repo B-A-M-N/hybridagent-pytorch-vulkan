@@ -1,0 +1,22 @@
+#version 450
+// Element-wise add with broadcast: c[i] = a[i] + alpha * b[bidx(i)]
+// bidx(i) is computed from b's row size, so a [R, N] matrix can be scaled by a
+// [R, 1] column vector (row bias) or a [1, N] row vector.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;   // a/c element count
+    uint b_size;        // b element count
+    float alpha;
+} params;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.num_elements) return;
+    uint bi = (params.b_size == 1u) ? 0u : (i % params.b_size);
+    c[i] = a[i] + params.alpha * b[bi];
+}

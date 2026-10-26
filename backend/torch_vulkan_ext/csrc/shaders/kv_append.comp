@@ -1,0 +1,41 @@
+#version 450
+// Append K and V from a packed [Q | K | V] buffer into the persistent KV cache
+// at slot `pos`.
+//   kv:       [q_len + 2 * kv_len]  -- Q at 0, K at q_len, V at q_len + kv_len
+//   k_cache:  [n_kv_heads, cap, head_dim]
+//   v_cache:  [n_kv_heads, cap, head_dim]
+//
+// One thread per element of K and V; each writes one distinct slot, so there are
+// no races. Run as a separate dispatch after `rope_qkv` so the RoPE writes are
+// globally visible before they are read.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufKV { float kv[]; };
+layout(set = 0, binding = 1) buffer BufK  { float k_cache[]; };
+layout(set = 0, binding = 2) buffer BufV  { float v_cache[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint pos;        // slot to write
+    uint cap;        // slots per kv head
+    uint head_dim;
+    uint q_len;      // n_heads * head_dim  (K starts here)
+    uint kv_len;     // n_kv_heads * head_dim
+} params;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = 2u * params.kv_len;
+    if (i >= total) return;
+
+    bool is_v = i >= params.kv_len;
+    uint src = is_v ? (i - params.kv_len) : i;   // index within the K or V block
+    uint head = src / params.head_dim;
+    uint d = src % params.head_dim;
+    uint dst = head * params.cap * params.head_dim + params.pos * params.head_dim + d;
+
+    if (is_v) {
+        v_cache[dst] = kv[params.q_len + params.kv_len + src];
+    } else {
+        k_cache[dst] = kv[params.q_len + src];
+    }
+}

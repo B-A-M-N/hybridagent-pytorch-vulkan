@@ -1,0 +1,51 @@
+#version 450
+// Transposed matmul with bias: C[M,N] = A[M,K] @ W[N,K]^T + bias
+// W is stored [N, K] (the nn.Linear layout), so the contraction is over K and
+// each output element (m, n) reads row n of W.
+//
+// Register-tiled with shared-memory staging. The naive version re-read the
+// whole K row from VRAM for every output element, which made a 4096x4096
+// projection with M=12 take 5.5 ms -- more than the rest of the transformer
+// layer combined.
+//
+// Shared-memory layout (verified with tests/probe_mm_diag.py):
+//   sA[y][x] = A[row, t + x]      -> sA[ly][k] is A[row, t+k]
+//   sW[y][x] = W[x-col, t + y]   -> sW[k][lx] is W[lx-col, t+k]
+// so thread (ly, lx) accumulates
+//   sum_k sA[ly][k] * sW[k][lx]
+// Reading sW[lx][k] instead transposes W, which is what the earlier attempts
+// did: the observed output 1*5 + 2*7 (rather than 1*5 + 2*6) is exactly that
+// transposition.
+#define TILE 16
+layout(local_size_x = TILE, local_size_y = TILE) in;
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufW { float w[]; };
+layout(set = 0, binding = 2) buffer BufBias { float bias[]; };
+layout(set = 0, binding = 3) buffer BufC { float c[]; };
+layout(push_constant) uniform PushConstants {
+    uint M; uint K; uint N; uint tiles_x;
+} params;
+shared float sA[TILE][TILE];
+shared float sW[TILE][TILE];
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint tile_x = wg % params.tiles_x;
+    uint tile_y = wg / params.tiles_x;
+    uint row = tile_y * TILE + gl_LocalInvocationID.y;
+    uint col = tile_x * TILE + gl_LocalInvocationID.x;
+    float acc = (row < params.M && col < params.N) ? bias[col] : 0.0;
+    for (uint t = 0; t < params.K; t += TILE) {
+        sA[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < params.M && (t + gl_LocalInvocationID.x) < params.K)
+                ? a[row * params.K + t + gl_LocalInvocationID.x] : 0.0;
+        sW[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (col < params.N && (t + gl_LocalInvocationID.y) < params.K)
+                ? w[col * params.K + t + gl_LocalInvocationID.y] : 0.0;
+        barrier();
+        for (uint k = 0; k < TILE; k++) {
+            acc += sA[gl_LocalInvocationID.y][k] * sW[k][gl_LocalInvocationID.x];
+        }
+        barrier();
+    }
+    if (row < params.M && col < params.N) c[row * params.N + col] = acc;
+}

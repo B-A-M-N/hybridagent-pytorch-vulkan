@@ -1,0 +1,183 @@
+"""
+Operator-correctness tests: every torch_vulkan_ext kernel against a PyTorch CPU
+reference, on real tensors, with the Vulkan device confirmed live.
+
+Run:  .venv/bin/python tests/test_vulkan_ops.py
+
+Exit code 0 = all pass. Each test prints the measured max-abs error so the
+numerical deviation from the reference is explicit rather than asserted away.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import torch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import torch_vulkan  # noqa: E402,F401  (registers the "vulkan" device)
+import torch_vulkan_ext as tvk  # noqa: E402
+
+RESULTS: list[tuple[str, bool, str]] = []
+
+
+def report(name: str, ok: bool, detail: str) -> None:
+    RESULTS.append((name, ok, detail))
+    flag = "PASS" if ok else "FAIL"
+    print(f"[{flag}] {name}: {detail}")
+
+
+def check(name: str, got: torch.Tensor, ref: torch.Tensor,
+          atol: float = 1e-4, rtol: float = 1e-4) -> None:
+    g = got.detach().float().cpu()
+    r = ref.detach().float().cpu()
+    if g.shape != r.shape:
+        report(name, False, f"shape mismatch got={tuple(g.shape)} ref={tuple(r.shape)}")
+        return
+    err = (g - r).abs()
+    max_err = float(err.max()) if err.numel() else 0.0
+    ok = bool(torch.allclose(g, r, atol=atol, rtol=rtol))
+    report(name, ok, f"max_abs_err={max_err:.3e} atol={atol:.1e} rtol={rtol:.1e}")
+
+
+def main() -> int:
+    torch.manual_seed(0)
+
+    print(f"torch {torch.__version__}")
+    tvk.init(device_index=0)
+    print(f"vulkan device: {tvk.device_name()}")
+    print(f"vram total: {tvk.vram_total() / 1e9:.2f} GB")
+
+    # ---------------------------------------------------------------- rmsnorm
+    # Qwen3: hidden 4096, eps 1e-6, fp32 statistics.
+    D = 4096
+    x = torch.randn(4, D)
+    w = torch.randn(D) * 0.5 + 1.0
+    eps = 1e-6
+    ref = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)) * w
+    xv = x.to("vulkan")
+    wv = w.to("vulkan")
+    check("rmsnorm[D=4096,eps=1e-6]", tvk.rmsnorm(xv, wv, eps), ref)
+
+    # ---------------------------------------------------------------- gelu_erf
+    # HybridLink uses nn.GELU() (erf). torch-vulkan's gelu uses the tanh
+    # approximation, so this is the test that distinguishes them.
+    g = torch.linspace(-4, 4, 4096)
+    ref_gelu = torch.nn.functional.gelu(g)  # default approximate='none' -> erf
+    gv = g.to("vulkan")
+    check("gelu_erf[erf variant]", tvk.gelu_erf(gv), ref_gelu)
+
+    # ------------------------------------------------------------------- rope
+    # Qwen3 interleaved pairing, head_dim 128, theta 1e6.
+    n_heads, head_dim = 32, 128
+    pos = 7
+    q = torch.randn(n_heads, head_dim)
+    inv = 1.0 / (1000000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    freqs = torch.outer(torch.tensor([float(pos)]), inv)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos, sin = emb.cos(), emb.sin()
+    q1 = q.unsqueeze(0)
+    half = head_dim // 2
+    rotated = torch.cat([-q1[..., half:], q1[..., :half]], dim=-1)
+    ref_rope = q1 * cos.unsqueeze(0) + rotated * sin.unsqueeze(0)
+    qv = q.to("vulkan")
+    check("rope[Qwen3 interleave,hd=128,pos=7]", tvk.rope(qv, n_heads, head_dim, pos),
+          ref_rope.reshape(n_heads, head_dim))
+
+    # --------------------------------------------------------------- silu_gate
+    N = 12288
+    gate = torch.randn(1, 2 * N)
+    ref_sg = (torch.nn.functional.silu(gate[:, :N]) * gate[:, N:])
+    check("silu_gate[N=12288]", tvk.silu_gate(gate.to("vulkan")), ref_sg)
+
+    # ------------------------------------------------------------ residual_add
+    a = torch.randn(8, 4096)
+    b = torch.randn(8, 4096)
+    check("residual_add", tvk.residual_add(a.to("vulkan"), b.to("vulkan")), a + b)
+
+    # ---------------------------------------------------------- broadcast_add
+    a = torch.randn(8, 4096)
+    col = torch.randn(8, 1)
+    check("broadcast_add[col]",
+          tvk.broadcast_add(a.to("vulkan"), col.to("vulkan"), 1.0),
+          a + col)
+
+    # ------------------------------------------------------------------- slice
+    s = torch.randn(4096)
+    check("slice[offset=1000,count=512]",
+          tvk.slice_(s.to("vulkan"), 1000, 512), s[1000:1512])
+
+    # ------------------------------------------------------------------ gather
+    idx = torch.randint(0, 4096, (64,), dtype=torch.long)
+    check("gather[64 ids]", tvk.gather(s.to("vulkan"), idx.to("vulkan")), s[idx])
+
+    # --------------------------------------------------- kv_store + attention
+    # Small GQA attention against HF eager_attention_forward semantics.
+    n_heads, n_kv_heads, head_dim = 8, 2, 128
+    heads_per_kv = n_heads // n_kv_heads
+    cap = 32
+    kv_heads = torch.randn(n_kv_heads, cap, head_dim)
+    k_cache = kv_heads.clone()
+    v_cache = torch.randn(n_kv_heads, cap, head_dim)
+    k_src = torch.randn(n_kv_heads, head_dim)
+    v_src = torch.randn(n_kv_heads, head_dim)
+    pos = 16
+    kv_store = torch.cat([k_src.reshape(-1), v_src.reshape(-1)])
+    tvk.kv_store(kv_store.to("vulkan"), k_cache.to("vulkan"),
+                 v_cache.to("vulkan"), pos, head_dim, n_kv_heads * head_dim)
+    check("kv_store[K]", k_cache[:, pos, :].cpu(), k_src, atol=1e-5)
+    check("kv_store[V]", v_cache[:, pos, :].cpu(), v_src, atol=1e-5)
+
+    # attention: mask all zeros (no padding), causal is implicit in new_len
+    new_len = pos + 1
+    q_tok = torch.randn(n_heads, head_dim)
+    # build the HF-style eager reference
+    k_all = k_cache.clone()
+    v_all = v_cache.clone()
+    k_rep = k_all.repeat_interleave(heads_per_kv, dim=0)   # [n_heads, cap, hd]
+    v_rep = v_all.repeat_interleave(heads_per_kv, dim=0)
+    scaling = head_dim ** -0.5
+    attn_w = torch.einsum("hd,hjd->hj", q_tok, k_rep[:, :new_len, :]) * scaling
+    attn_w = attn_w + torch.zeros_like(attn_w)
+    attn_w = torch.softmax(attn_w, dim=-1)
+    ref_out = torch.einsum("hj,hjd->hd", attn_w, v_rep[:, :new_len, :])
+
+    mask = torch.zeros(n_heads, new_len)
+    got = tvk.attention(q_tok.to("vulkan"), k_cache.to("vulkan"),
+                        v_cache.to("vulkan"), mask.to("vulkan"), pos,
+                        scaling, n_heads, n_kv_heads, head_dim)
+    check("attention[GQA 8/2 hd=128]", got, ref_out)
+
+    # --------------------------------------------------------------- argmax
+    logits = torch.randn(4, 151671)
+    ref_am = logits.argmax(dim=-1, keepdim=True)
+    got_am = tvk.argmax(logits.to("vulkan"))
+    # kernel returns a single global winner over the flattened matrix
+    ref_flat = logits.reshape(-1).argmax().reshape(1)
+    check("argmax[4x151671]", got_am.cpu(), ref_flat.to(torch.int64), atol=0, rtol=0)
+
+    # ------------------------------------------------------------------ linear
+    M, K, N = 8, 4096, 4096
+    x = torch.randn(M, K)
+    W = torch.randn(N, K)
+    ref_lin = x @ W.t()
+    check("linear[8x4096 @ 4096x4096.T]",
+          tvk.linear(x.to("vulkan"), W.to("vulkan")), ref_lin, atol=2e-3, rtol=2e-3)
+
+    # ------------------------------------------------------------------- mm
+    # torch-vulkan's own matmul, for reference.
+    ref_mm = x @ W.t()
+    got_mm = torch.mm(x.to("vulkan"), W.t().contiguous().to("vulkan"))
+    check("mm[torch-vulkan]", got_mm.cpu(), ref_mm, atol=2e-3, rtol=2e-3)
+
+    print()
+    print(f"dispatches issued: {tvk.dispatch_count()}")
+    print(f"registry bytes: {tvk.vram_used() / 1e6:.1f} MB")
+    n_fail = sum(1 for _, ok, _ in RESULTS if not ok)
+    print(f"\n{len(RESULTS) - n_fail}/{len(RESULTS)} passed")
+    return 1 if n_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

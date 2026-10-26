@@ -1,0 +1,99 @@
+#version 450
+// DIAGNOSTIC: dump the intermediate values of attention2's score computation
+// for a fixed small case, so the FIRST divergent value can be identified.
+//
+// Mirrors attention2.comp's addressing exactly (same bases, same strides) but
+// writes, per (head, query row, key index):
+//   slot 0 : raw dot product q.k          (before scaling and mask)
+//   slot 1 : scaled + masked score
+//   slot 2 : exp(score - rowmax)
+//   slot 3 : normalised weight
+//   slot 4 : q offset used
+//   slot 5 : k offset used
+//   slot 6 : q value at lane 0
+//   slot 7 : k value at lane 0
+//
+// This isolates step 1 (Q x K^T) from step 2 (softmax/mask) and step 3 (x V).
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer BufQ    { float q[]; };
+layout(set = 0, binding = 1) buffer BufK    { float k_cache[]; };
+layout(set = 0, binding = 2) buffer BufMask { float mask[]; };
+layout(set = 0, binding = 3) buffer BufDbg  { float dbg[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seq_start;
+    uint seq_len;
+    uint n_heads;
+    uint heads_per_kv;
+    uint head_dim;
+    uint cap;
+    uint n_q;
+    float scaling;
+} params;
+
+void main() {
+    uint wg    = gl_WorkGroupID.x;
+    uint batch = wg / params.n_heads;
+    uint h     = wg - batch * params.n_heads;
+    uint t     = gl_LocalInvocationID.x;
+
+    uint S    = params.seq_len;
+    uint hd   = params.head_dim;
+    uint hpk  = params.heads_per_kv;
+    uint nkv  = params.n_heads / hpk;
+    uint kv_h = h / hpk;
+    uint nq   = params.n_q;
+
+    uint q_base    = (batch * params.n_heads + h) * nq * hd;
+    uint k_base    = (batch * nkv + kv_h) * params.cap * hd;
+    uint mask_base = (batch * params.n_heads + h) * nq * S;
+
+    // debug slots per (head, row, key)
+    uint dbg_base  = ((batch * params.n_heads + h) * nq + 0) * S * 8;
+
+    if (hd != 128) return;
+
+    for (uint s = 0; s < nq; s++) {
+        uint qptr = q_base + s * hd;
+        float scores[512];
+
+        for (uint m = 0; m < S; m++) {
+            uint kptr = k_base + (params.seq_start + m) * hd;
+            float sc = 0.0;
+            for (uint d = 0; d < hd; d++) {
+                sc += q[qptr + d] * k_cache[kptr + d];
+            }
+            scores[m] = sc;
+
+            // slot 0: raw dot product (lane 0 writes)
+            if (t == 0) {
+                dbg[dbg_base + (s * S + m) * 8 + 0] = sc;
+                dbg[dbg_base + (s * S + m) * 8 + 4] = float(qptr);
+                dbg[dbg_base + (s * S + m) * 8 + 5] = float(kptr);
+                dbg[dbg_base + (s * S + m) * 8 + 6] = q[qptr];
+                dbg[dbg_base + (s * S + m) * 8 + 7] = k_cache[kptr];
+            }
+        }
+
+        float row_max = -3.4e38;
+        for (uint m = 0; m < S; m++) {
+            float sc = scores[m] * params.scaling + mask[mask_base + s * S + m];
+            scores[m] = sc;
+            if (t == 0) dbg[dbg_base + (s * S + m) * 8 + 1] = sc;
+            row_max = max(row_max, sc);
+        }
+        float sum = 0.0;
+        for (uint m = 0; m < S; m++) {
+            scores[m] = exp(scores[m] - row_max);
+            sum += scores[m];
+        }
+        float inv = (sum > 0.0) ? 1.0 / sum : 0.0;
+        for (uint m = 0; m < S; m++) {
+            if (t == 0) {
+                dbg[dbg_base + (s * S + m) * 8 + 2] = scores[m];
+                dbg[dbg_base + (s * S + m) * 8 + 3] = scores[m] * inv;
+            }
+        }
+    }
+}

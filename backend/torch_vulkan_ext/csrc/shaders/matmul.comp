@@ -1,0 +1,42 @@
+#version 450
+// General dense matmul: C[M,N] = A[M,K] @ B[K,N]  (row-major, all fp32)
+// One thread per output element; B is read with coalesced access along K.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} params;
+
+void main() {
+    // The host flattens every dispatch to 1-D, so gl_GlobalInvocationID.y is
+    // always 0 and cannot give the row. Recover (row, col) from the flat
+    // workgroup index plus the 16x16 local invocation ID.
+    uint wg   = gl_WorkGroupID.x;
+    uint tiles_x = (params.N + 15u) / 16u;
+    uint col = (wg % tiles_x) * 16u + gl_LocalInvocationID.x;
+    uint row = (wg / tiles_x) * 16u + gl_LocalInvocationID.y;
+    if (row >= params.M || col >= params.N) return;
+
+    float sum = 0.0;
+    uint k = 0;
+    for (; k + 4 <= params.K; k += 4) {
+        float a0 = a[row * params.K + k + 0];
+        float a1 = a[row * params.K + k + 1];
+        float a2 = a[row * params.K + k + 2];
+        float a3 = a[row * params.K + k + 3];
+        sum += a0 * b[(k + 0) * params.N + col];
+        sum += a1 * b[(k + 1) * params.N + col];
+        sum += a2 * b[(k + 2) * params.N + col];
+        sum += a3 * b[(k + 3) * params.N + col];
+    }
+    for (; k < params.K; k++) {
+        sum += a[row * params.K + k] * b[k * params.N + col];
+    }
+    c[row * params.N + col] = sum;
+}

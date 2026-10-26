@@ -1,0 +1,47 @@
+#version 450
+// RMSNorm: out[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps)
+// Matches Qwen3RMSNorm, which computes in fp32 and applies the weight in fp32.
+// One workgroup per row; shared-memory parallel reduction of sum(x^2).
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufIn    { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufWeight{ float weight[]; };
+layout(set = 0, binding = 2) buffer BufOut   { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_rows;
+    uint row_size;
+    float eps;
+} params;
+
+shared float sdata[WG_SIZE];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= params.num_rows) return;
+
+    uint base = row * params.row_size;
+
+    float sum_sq = 0.0;
+    for (uint i = tid; i < params.row_size; i += WG_SIZE) {
+        float v = in_data[base + i];
+        sum_sq += v * v;
+    }
+    sdata[tid] = sum_sq;
+    barrier();
+
+    for (uint s = WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float inv_rms = inversesqrt(sdata[0] / float(params.row_size) + params.eps);
+    barrier();
+
+    for (uint i = tid; i < params.row_size; i += WG_SIZE) {
+        out_data[base + i] = in_data[base + i] * inv_rms * weight[i];
+    }
+}
