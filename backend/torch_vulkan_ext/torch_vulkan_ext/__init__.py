@@ -279,11 +279,21 @@ def _dispatch(shader, bufs, push, gx, gy, gz, sync=True):
     the GPU still reads it, the kernel reads unmapped VA and silently returns
     zeros (or worse). Submission is not completion, so the reference is held
     here rather than at each call site.
+
+    `acquire()` is also a *Python* reference for the duration of this function:
+    an inline `_Buf(...)` argument is otherwise garbage-collected the moment the
+    calling expression finishes, which returns its memory to the allocator while
+    the dispatch is still being set up.
     """
     lib = _load()
     # Take a reference on every buffer for the whole dispatch, sync or async.
     # For sync dispatches the queue drains before we return, so the holds are
     # released immediately below; for async ones they stay until submit().
+    #
+    # `anchor()` covers the hazardous inline form `_Buf(t).buf`: the temporary
+    # wrapper's refcount drops to zero at the end of that expression, BEFORE the
+    # dispatch it feeds has been issued. The anchor holds the wrapper (and so its
+    # VkBuffer) until the queue has drained.
     holds = [b.acquire() for b in bufs]
     handles = (ctypes.c_ulonglong * len(bufs))(*[b.vk_handle for b in bufs])
     push_buf = ctypes.create_string_buffer(push) if push else None
@@ -489,7 +499,6 @@ def matmul_t_bias(x: VkBuffer, w: VkBuffer, bias: VkBuffer, out: VkBuffer,
     The grid is flattened to 1-D (RADV ignores dispatch Y/Z); the shader
     reconstructs the tile indices from `tiles_x`.
     """
-    push = u32(M) + u32(K) + u32(N)
     tiles_x = (N + 15) // 16
     tiles_y = (M + 15) // 16
     push = u32(M) + u32(K) + u32(N) + u32(tiles_x)

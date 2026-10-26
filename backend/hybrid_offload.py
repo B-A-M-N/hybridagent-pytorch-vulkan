@@ -150,14 +150,19 @@ class _Buf:
 
     Lifetime
     --------
-    A queued (async) dispatch holds a raw pointer into `self.buf`. If this object
-    is garbage-collected while the queue is still in flight, `VkBuffer.__del__`
+    A queued dispatch holds a raw pointer into `self.buf`. If this object is
+    garbage-collected while the queue is still in flight, `VkBuffer.__del__`
     frees the buffer and the GPU reads unmapped VA -- which on RADV surfaces as
-    `GPUVM fault` / `context is lost`. Submission is not completion.
+    `GPUVM fault` / `context is lost`, or silently returns zeros.
 
-    So `_Buf` keeps an explicit hold count: `keep()` is called by any async
-    dispatch that references the buffer, and `drop()` once the layer has drained
-    the queue. A `_Buf` with outstanding holds is never freed early.
+    Submission is not completion. So `_Buf` keeps an explicit hold count:
+    `keep()` is called by any dispatch that references the buffer, and
+    `drop()` once the layer has drained the queue.
+
+    `_dispatch` also takes a reference for the duration of each call, which
+    covers the common (and hazardous) inline form `_Buf(t).buf` -- the temporary
+    would otherwise be collected at the end of that expression, before the
+    dispatch it feeds has even been issued.
     """
 
     __slots__ = ("buf", "shape", "_holds")
@@ -181,19 +186,14 @@ class _Buf:
         self._holds = max(0, self._holds - 1)
 
     def __del__(self):
-        # Defer destruction while queued work still references the buffer: the
-        # VkBuffer is freed when the hold count reaches zero AND no queued
-        # dispatch is outstanding. Submission is not completion, so a buffer
-        # dropped by Python while the queue is in flight would otherwise be
-        # unmapped under the GPU.
-        if self._holds > 0:
-            return
+        # Release this wrapper's reference on the VkBuffer. The buffer is only
+        # actually freed when the LAST reference goes -- `_dispatch` takes its
+        # own reference via `acquire()` for the duration of a dispatch, so a
+        # buffer the GPU is still reading is never unmapped underneath it.
         b = getattr(self, "buf", None)
         if b is not None:
             try:
-                b._refs -= 1
-                if b._refs <= 0:
-                    b._free()
+                b.release()
             except Exception:
                 pass
 
@@ -326,7 +326,10 @@ class VulkanDecoderLayer(torch.nn.Module):
 
         # ---- input RMSNorm (device-resident)
         note("rmsnorm.input")
-        h = self._rms_b(_Buf(h.reshape(-1, h.shape[-1])), self._w["input_ln"])
+        # Bind the temporary: a bare `_Buf(t)` is collected at the end of the
+        # expression, which can unmap the buffer before the dispatch runs.
+        _h_in = _Buf(h.reshape(-1, h.shape[-1]))
+        h = self._rms_b(_h_in, self._w["input_ln"])
 
         # ---- q/k/v projections + QK-norm, all on device
         note("matmul.q_proj")
