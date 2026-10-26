@@ -294,11 +294,21 @@ class VulkanDecoderLayer(torch.nn.Module):
                           )
         return ob
 
-    def _rms_b(self, x, w: _Buf):
+    def _rms_b(self, x, w: _Buf, sync: bool = True):
         rs = x.shape[-1]
         xb = x if isinstance(x, _Buf) else _Buf(x.reshape(-1, rs))
         ob = _Buf.out(xb.shape)
-        tvk.rmsnorm(xb.buf, w.buf, ob.buf, xb.shape[0], rs, self.eps)
+        tvk.rmsnorm(xb.buf, w.buf, ob.buf, xb.shape[0], rs, self.eps, sync=sync)
+        return ob
+
+    def _lin_b(self, x, w: _Buf, bias: _Buf, out_features: int,
+               sync: bool = True):
+        M = x.shape[0] if isinstance(x, _Buf) else x.numel() // x.shape[-1]
+        K = x.shape[-1]
+        xb = x if isinstance(x, _Buf) else _Buf(x.reshape(M, K))
+        ob = _Buf.out((M, out_features))
+        tvk.matmul_t_bias(xb.buf, w.buf, bias.buf, ob.buf, M, K, out_features,
+                          sync=sync)
         return ob
 
     def _lin(self, x: torch.Tensor, w: _Buf, bias: _Buf, out_features: int):
@@ -332,6 +342,13 @@ class VulkanDecoderLayer(torch.nn.Module):
         h = self._rms_b(_h_in, self._w["input_ln"])
 
         # ---- q/k/v projections + QK-norm, all on device
+        #
+        # NOTE: these ops are deliberately synchronous. Batching them
+        # asynchronously was tried and REVERTED -- the `.cpu()` readbacks that
+        # reshape q/k between ops read buffers whose writes had not been
+        # submitted, producing garbage output. Safe batching requires keeping
+        # those intermediates on-device, which needs a concat/pack kernel that
+        # does not exist yet.
         note("matmul.q_proj")
         q = self._lin_b(h, self._w["q"], self._zero_hd,
                         self.num_heads * self.head_dim)
@@ -339,14 +356,14 @@ class VulkanDecoderLayer(torch.nn.Module):
         # QK-norm normalises over head_dim, so the [M, n_heads*hd] buffer must be
         # viewed as [M*n_heads, hd] first.
         M = q.shape[0]
-        q = self._rms_b(q.cpu().reshape(M * self.num_heads, self.head_dim),
+        q = self._rms_b(_Buf(q.cpu().reshape(M * self.num_heads, self.head_dim)),
                          self._w["q_norm"])
 
         note("matmul.k_proj")
         k = self._lin_b(h, self._w["k"], self._zero_kvd,
                         self.num_kv_heads * self.head_dim)
         note("rmsnorm.k_norm")
-        k = self._rms_b(k.cpu().reshape(M * self.num_kv_heads, self.head_dim),
+        k = self._rms_b(_Buf(k.cpu().reshape(M * self.num_kv_heads, self.head_dim)),
                          self._w["k_norm"])
 
         note("matmul.v_proj")
