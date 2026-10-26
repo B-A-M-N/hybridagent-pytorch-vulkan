@@ -371,12 +371,12 @@ class VulkanDecoderLayer(torch.nn.Module):
 
         # ---- q/k/v projections + QK-norm, all on device
         #
-        # NOTE: these ops are deliberately synchronous. Batching them
-        # asynchronously was tried and REVERTED -- the `.cpu()` readbacks that
-        # reshape q/k between ops read buffers whose writes had not been
-        # submitted, producing garbage output. Safe batching requires keeping
-        # those intermediates on-device, which needs a concat/pack kernel that
-        # does not exist yet.
+        # These ops stay SYNCHRONOUS. Batching them asynchronously was attempted
+        # twice and reverted both times: the async path reads buffers whose
+        # writes have not been submitted, and the layer produces garbage
+        # ('3 English, , 0'). Making it safe needs per-buffer submission
+        # tracking, not just the pack kernel -- the pack kernel removed the
+        # round trips but did not make the async ordering correct.
         note("matmul.q_proj")
         q = self._lin_b(h, self._w["q"], self._zero_hd,
                         self.num_heads * self.head_dim)
