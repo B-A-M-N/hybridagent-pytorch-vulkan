@@ -44,6 +44,7 @@ cast is a reported numerical change.
 from __future__ import annotations
 
 import os
+import struct
 import time
 from dataclasses import dataclass, field
 
@@ -51,6 +52,11 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 import torch_vulkan_ext as tvk
+
+
+def u32(v) -> bytes:
+    """Little-endian uint32, for hand-packed push constants."""
+    return struct.pack("<I", int(v))
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +219,28 @@ class _Buf:
     def cpu(self):
         return self.buf.download(self.shape)
 
+    def view(self, *shape):
+        """Reinterpret the same bytes under a new shape -- no copy.
+
+        The QK-norm needs a `[S, n_heads*head_dim]` buffer viewed as
+        `[S*n_heads, head_dim]`. Those describe identical contiguous bytes, so
+        this is a label change. Going through `.cpu()` would be a
+        device->host->device round trip with a `vkQueueWaitIdle` on each side,
+        and there were three of them per layer forward.
+        """
+        n = 1
+        for s in shape:
+            n *= s
+        assert n == self.buf.size // 4, (
+            f"view({shape}) = {n} elements but buffer holds {self.buf.size // 4}")
+        o = self.__class__.__new__(self.__class__)
+        o.buf = self.buf
+        o.shape = tuple(shape)
+        o._holds = self._holds
+        # The new wrapper must not free the shared VkBuffer twice.
+        o.buf.acquire()
+        return o
+
 
 class VulkanDecoderLayer(torch.nn.Module):
     """One Qwen3 decoder layer executed on the Vulkan device.
@@ -354,16 +382,16 @@ class VulkanDecoderLayer(torch.nn.Module):
                         self.num_heads * self.head_dim)
         note("rmsnorm.q_norm")
         # QK-norm normalises over head_dim, so the [M, n_heads*hd] buffer must be
-        # viewed as [M*n_heads, hd] first.
+        # viewed as [M*n_heads, hd] first. `view()` reinterprets the same bytes.
         M = q.shape[0]
-        q = self._rms_b(_Buf(q.cpu().reshape(M * self.num_heads, self.head_dim)),
+        q = self._rms_b(q.view(M * self.num_heads, self.head_dim),
                          self._w["q_norm"])
 
         note("matmul.k_proj")
         k = self._lin_b(h, self._w["k"], self._zero_kvd,
                         self.num_kv_heads * self.head_dim)
         note("rmsnorm.k_norm")
-        k = self._rms_b(_Buf(k.cpu().reshape(M * self.num_kv_heads, self.head_dim)),
+        k = self._rms_b(k.view(M * self.num_kv_heads, self.head_dim),
                          self._w["k_norm"])
 
         note("matmul.v_proj")
@@ -376,17 +404,22 @@ class VulkanDecoderLayer(torch.nn.Module):
         pos_start = int(cache_position[0].item()) if cache_position is not None else 0
         HD = self.num_heads * self.head_dim
         KVD = self.num_kv_heads * self.head_dim
-        # q/k come back from QK-norm as [S*n_heads, head_dim]; the RoPE packing
-        # expects [S, n_heads*head_dim], so flatten them back to per-token.
-        q_flat = q.cpu().reshape(S, HD)
-        k_flat = k.cpu().reshape(S, KVD)
-        v_flat = v.cpu().reshape(S, KVD)
-        qkv = _Buf(torch.cat([q_flat.reshape(-1), k_flat.reshape(-1),
-                              v_flat.reshape(-1)]))
+        # q/k/v stay device-resident. Previously this was
+        #     q.cpu(); k.cpu(); v.cpu(); torch.cat([...]); _Buf(...)
+        # i.e. three device->host round trips plus three uploads, each carrying a
+        # `vkQueueWaitIdle`. The pack kernel replaces all of it with one dispatch.
+        q_t = q.view(S, HD)
+        k_t = k.view(S, KVD)
+        v_t = v.view(S, KVD)
+        qkv = tvk.VkBuffer(max(1, S * (HD + 2 * KVD)) * 4, "device")
+        tvk.dispatch(
+            "pack3", [q_t.buf, k_t.buf, v_t.buf, qkv],
+            u32(S) + u32(HD) + u32(KVD) + u32(KVD),
+            (S * (HD + 2 * KVD) + 63) // 64, 1, 1)
         note("rope")
-        tvk.rope_qkv(qkvb := qkv.buf, pos_start, self.num_heads,
+        tvk.rope_qkv(qkv, pos_start, self.num_heads,
                      self.num_kv_heads, self.head_dim, n_tok=S)
-        qkv2 = qkv.cpu()
+        qkv2 = qkv.download((S * (HD + 2 * KVD),))
         q = qkv2[:S * HD].view(S, self.num_heads, self.head_dim)
         k = qkv2[S * HD:S * HD + S * KVD].view(S, self.num_kv_heads, self.head_dim)
         v = qkv2[S * HD + S * KVD:S * HD + 2 * S * KVD].view(S, self.num_kv_heads,

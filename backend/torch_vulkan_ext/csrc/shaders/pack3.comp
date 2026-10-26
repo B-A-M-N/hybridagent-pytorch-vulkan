@@ -1,0 +1,48 @@
+#version 450
+// Device-side pack of three [S, W] fp32 tensors into one flat buffer laid out
+// as [all Q][all K][all V] -- the layout `rope_qkv.comp` expects.
+//
+// WHY THIS EXISTS
+// ---------------
+// The layer computes q/k/v projections then concatenates them for RoPE. It
+// currently does:
+//     q_flat = q.cpu(); k_flat = k.cpu(); v_flat = v.cpu()
+//     qkv    = _Buf(torch.cat([...]))
+// which is THREE device->host round trips plus three host->device uploads per
+// layer forward, each with a `vkQueueWaitIdle`. Measured: 12 dispatches and 9
+// host round-trips per layer, and that overhead -- not arithmetic -- is what
+// makes Vulkan lose at short sequence lengths and in the latent loop.
+//
+// This kernel performs the same concatenation with ONE dispatch and zero host
+// round trips. `rope_qkv` wants K at offset S*W1 and V at S*W1 + S*W2, so the
+// destination is three contiguous blocks, not an interleaving per token.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer BufQ { float q[]; };
+layout(set = 0, binding = 1) buffer BufK { float k[]; };
+layout(set = 0, binding = 2) buffer BufV { float v[]; };
+layout(set = 0, binding = 3) buffer BufD { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint S;    // tokens
+    uint W1;   // q width per token
+    uint W2;   // k width per token
+    uint W3;   // v width per token
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint n1 = params.S * params.W1;
+    uint n2 = params.S * params.W2;
+    uint n3 = params.S * params.W3;
+    uint total = n1 + n2 + n3;
+    if (gid >= total) return;
+
+    if (gid < n1) {
+        dst[gid] = q[gid];
+    } else if (gid < n1 + n2) {
+        dst[gid] = k[gid - n1];
+    } else {
+        dst[gid] = v[gid - n1 - n2];
+    }
+}
