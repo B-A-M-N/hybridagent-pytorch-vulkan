@@ -122,6 +122,11 @@ class Placement:
     def __len__(self) -> int:
         return len(self.layers_on_gpu)
 
+    @property
+    def num_gpu_layers(self) -> int:
+        """Convenience property for the number of GPU layers."""
+        return len(self.layers_on_gpu)
+
 
 def bytes_per_layer(hidden: int, inter: int, n_heads: int, head_dim: int,
                     n_kv_heads: int) -> int:
@@ -157,8 +162,8 @@ class _Buf:
     Lifetime
     --------
     A queued dispatch holds a raw pointer into `self.buf`. If this object is
-    garbage-collected while the queue is still in flight, `VkBuffer.__del__`
-    frees the buffer and the GPU reads unmapped VA -- which on RADV surfaces as
+    garbage-collected while the queue is still in flight, the allocation is freed
+    and the GPU reads unmapped VA -- which on RADV surfaces as
     `GPUVM fault` / `context is lost`, or silently returns zeros.
 
     Submission is not completion. So `_Buf` keeps an explicit hold count:
@@ -171,15 +176,14 @@ class _Buf:
     dispatch it feeds has even been issued.
     """
 
-    __slots__ = ("buf", "shape", "_holds")
+    __slots__ = ("_alloc", "_view", "shape", "_holds")
 
     def __init__(self, t: torch.Tensor, kind: str = "device"):
         t = t.detach().to(torch.float32).contiguous()
-        self.buf = tvk.VkBuffer(max(1, t.numel()) * 4, kind)
-        if kind == "host":
-            self.buf.upload(torch.zeros(max(1, t.numel())))
-        else:
-            self.buf.upload(t)
+        nbytes = max(1, t.numel()) * 4
+        self._alloc = tvk.Allocation(nbytes, kind)
+        self._view = self._alloc.view()
+        self._view.upload(t)
         self.shape = tuple(t.shape)
         self._holds = 0
 
@@ -192,16 +196,22 @@ class _Buf:
         self._holds = max(0, self._holds - 1)
 
     def __del__(self):
-        # Release this wrapper's reference on the VkBuffer. The buffer is only
-        # actually freed when the LAST reference goes -- `_dispatch` takes its
-        # own reference via `acquire()` for the duration of a dispatch, so a
-        # buffer the GPU is still reading is never unmapped underneath it.
-        b = getattr(self, "buf", None)
-        if b is not None:
+        # Release this wrapper's reference on the Allocation.
+        a = getattr(self, "_alloc", None)
+        if a is not None:
             try:
-                b.release()
+                a.free()
             except Exception:
                 pass
+
+    @property
+    def buf(self):
+        """Backward compatibility: return the BufferView for dispatch."""
+        return self._view
+
+    @property
+    def size(self):
+        return self._view.size
 
     @classmethod
     def out(cls, shape):
@@ -209,15 +219,17 @@ class _Buf:
         n = 1
         for s in shape:
             n *= s
-        b = tvk.VkBuffer(max(1, n) * 4, "device")
+        alloc = tvk.Allocation(max(1, n) * 4, "device")
+        view = alloc.view()
         o = cls.__new__(cls)
-        o.buf = b
+        o._alloc = alloc
+        o._view = view
         o.shape = tuple(shape)
         o._holds = 0
         return o
 
     def cpu(self):
-        return self.buf.download(self.shape)
+        return self._view.download(self.shape)
 
     def view(self, *shape):
         """Reinterpret the same bytes under a new shape -- no copy.
@@ -231,14 +243,24 @@ class _Buf:
         n = 1
         for s in shape:
             n *= s
-        assert n == self.buf.size // 4, (
-            f"view({shape}) = {n} elements but buffer holds {self.buf.size // 4}")
+        assert n == self._view.size // 4, (
+            f"view({shape}) = {n} elements but buffer holds {self._view.size // 4}")
         o = self.__class__.__new__(self.__class__)
-        o.buf = self.buf
+        o._alloc = self._alloc
+        o._view = self._alloc.view(0, self._view.size)
         o.shape = tuple(shape)
         o._holds = self._holds
-        # The new wrapper must not free the shared VkBuffer twice.
-        o.buf.acquire()
+        # The new wrapper must not free the shared Allocation twice.
+        return o
+
+    @classmethod
+    def _wrap(cls, buf, nbytes):
+        """Wrap an existing BufferView with known byte size."""
+        o = cls.__new__(cls)
+        o._alloc = buf._alloc
+        o._view = buf
+        o.shape = (nbytes // 4,)
+        o._holds = 0
         return o
 
 
@@ -303,12 +325,67 @@ class VulkanDecoderLayer(torch.nn.Module):
         self._zero_i = _Buf(torch.zeros(c.intermediate_size))
         self._uploaded = True
 
+    # -- Q4 weight support ---------------------------------------------------
+    def upload_weights_q4(self) -> None:
+        """Upload this layer's weights in Q4 format for memory-constrained GPUs."""
+        if getattr(self, "_uploaded_q4", False):
+            return
+        from backend.quantize_q4 import quantize_weight, GROUP_SIZE
+        c = self.config
+        h = self.hidden_size
+        nh, nkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        
+        # Quantize the large linear weights
+        self._w_q4 = {}
+        self._w_q4["q"] = quantize_weight(self.self_attn.q_proj.weight.detach())
+        self._w_q4["k"] = quantize_weight(self.self_attn.k_proj.weight.detach())
+        self._w_q4["v"] = quantize_weight(self.self_attn.v_proj.weight.detach())
+        self._w_q4["o"] = quantize_weight(self.self_attn.o_proj.weight.detach())
+        self._w_q4["down"] = quantize_weight(self.mlp.down_proj.weight.detach())
+        
+        # Upload packed weights as byte buffers
+        import numpy as np
+        def upload_packed(packed: bytes) -> _Buf:
+            raw = np.frombuffer(packed, dtype=np.uint8).astype(np.uint8)
+            pad = (-len(raw)) % 4
+            if pad:
+                raw = np.concatenate([raw, np.zeros(pad, dtype=np.uint8)])
+            nbytes = len(raw)
+            fb = torch.from_numpy(np.frombuffer(raw.tobytes(), dtype=np.float32).copy())
+            assert fb.numel() * 4 == nbytes, f"{fb.numel() * 4} != {nbytes}"
+            wb = tvk.VkBuffer(nbytes, "device")
+            wb.upload(fb)
+            return _Buf._wrap(wb, nbytes)
+        
+        self._w_q4_buf = {k: upload_packed(v) for k, v in self._w_q4.items()}
+        self._uploaded_q4 = True
+
+    def _lin_b_q4(self, x, w_q4_buf: _Buf, bias: _Buf, out_features: int, K: int):
+        """Q4 matmul: x @ dequantize(w_q4)^T + bias. x on device, w_q4 packed."""
+        if isinstance(x, _Buf):
+            M = x.shape[0]
+            xb = x
+        else:
+            M = x.numel() // x.shape[-1]
+            K = x.shape[-1]
+            xb = _Buf(x.reshape(M, K))
+        ob = _Buf.out((M, out_features))
+        import struct
+        tiles_x = (out_features + 15) // 16
+        tiles_y = (M + 15) // 16
+        push = (struct.pack("<I", M) + struct.pack("<I", K) + struct.pack("<I", out_features) +
+                struct.pack("<I", tiles_x) + struct.pack("<I", 128))  # group_size=128
+        tvk.dispatch("matmul_q4", [xb.buf, w_q4_buf.buf, ob.buf], push,
+                     tiles_x * tiles_y, 1, 1)
+        return ob
+
     # -- kernel helpers ----------------------------------------------------
     # These keep intermediates ON DEVICE and return the raw buffer, so a layer
     # does not pay a host round trip per op. Only the caller's final results are
     # downloaded. Downloading per-op cost ~0.26 ms and dominated layer timing.
-    def _lin_b(self, x, w: _Buf, bias: _Buf, out_features: int):
-        """x may be a CPU tensor or an on-device _Buf."""
+    def _lin_b(self, x, w: _Buf, bias: _Buf, out_features: int,
+               sync: bool = False):
+        """x may be a CPU tensor or an on-device _Buf. Default sync=False for async batching."""
         if isinstance(x, _Buf):
             M = x.shape[0]
             K = x.shape[1]
@@ -319,24 +396,34 @@ class VulkanDecoderLayer(torch.nn.Module):
             xb = _Buf(x.reshape(M, K))
         ob = _Buf.out((M, out_features))
         tvk.matmul_t_bias(xb.buf, w.buf, bias.buf, ob.buf, M, K, out_features,
-                          )
+                          sync=sync)
         return ob
 
-    def _rms_b(self, x, w: _Buf, sync: bool = True):
+    def _rms_b(self, x, w: _Buf, sync: bool = False):
         rs = x.shape[-1]
         xb = x if isinstance(x, _Buf) else _Buf(x.reshape(-1, rs))
         ob = _Buf.out(xb.shape)
         tvk.rmsnorm(xb.buf, w.buf, ob.buf, xb.shape[0], rs, self.eps, sync=sync)
         return ob
 
-    def _lin_b(self, x, w: _Buf, bias: _Buf, out_features: int,
-               sync: bool = True):
-        M = x.shape[0] if isinstance(x, _Buf) else x.numel() // x.shape[-1]
-        K = x.shape[-1]
-        xb = x if isinstance(x, _Buf) else _Buf(x.reshape(M, K))
+    def _lin_b_q4(self, x, w_q4_buf: _Buf, bias: _Buf, out_features: int, K: int,
+                  sync: bool = False):
+        """Q4 matmul: x @ dequantize(w_q4)^T + bias. x on device, w_q4 packed."""
+        if isinstance(x, _Buf):
+            M = x.shape[0]
+            xb = x
+        else:
+            M = x.numel() // x.shape[-1]
+            K = x.shape[-1]
+            xb = _Buf(x.reshape(M, K))
         ob = _Buf.out((M, out_features))
-        tvk.matmul_t_bias(xb.buf, w.buf, bias.buf, ob.buf, M, K, out_features,
-                          sync=sync)
+        import struct
+        tiles_x = (out_features + 15) // 16
+        tiles_y = (M + 15) // 16
+        push = (struct.pack("<I", M) + struct.pack("<I", K) + struct.pack("<I", out_features) +
+                struct.pack("<I", tiles_x) + struct.pack("<I", 128))  # group_size=128
+        tvk.dispatch("matmul_q4", [xb.buf, w_q4_buf.buf, ob.buf], push,
+                     tiles_x * tiles_y, 1, 1, sync=sync)
         return ob
 
     def _lin(self, x: torch.Tensor, w: _Buf, bias: _Buf, out_features: int):
@@ -348,8 +435,12 @@ class VulkanDecoderLayer(torch.nn.Module):
 
     def forward(self, hidden_states, position_embeddings, attention_mask,
                 past_key_values=None, cache_position=None, stats=None,
-                **_kwargs):
+                use_q4: bool = False, **_kwargs):
+        # Always upload fp32 weights (norms, gate_up) - they're small
         self.upload_weights()
+        # Optionally upload Q4 weights for the large linear layers
+        if use_q4:
+            self.upload_weights_q4()
 
         t0 = time.time()
         layer_dtype = hidden_states.dtype
@@ -357,46 +448,53 @@ class VulkanDecoderLayer(torch.nn.Module):
         # Every _Buf allocated below is appended here so it survives until the
         # queue drains. Without this, Python frees a buffer while queued work
         # still references it and the GPU reads unmapped VA.
+        _keep_alive = []
 
         def note(op):
             if stats is not None:
                 stats.record(op, "vulkan")
 
+        def keep(buf):
+            _keep_alive.append(buf)
+            return buf
+
         # ---- input RMSNorm (device-resident)
         note("rmsnorm.input")
-        # Bind the temporary: a bare `_Buf(t)` is collected at the end of the
-        # expression, which can unmap the buffer before the dispatch runs.
-        _h_in = _Buf(h.reshape(-1, h.shape[-1]))
+        _h_in = keep(_Buf(h.reshape(-1, h.shape[-1])))
         h = self._rms_b(_h_in, self._w["input_ln"])
+        keep(h)
 
         # ---- q/k/v projections + QK-norm, all on device
-        #
-        # These ops stay SYNCHRONOUS. Batching them asynchronously was attempted
-        # twice and reverted both times: the async path reads buffers whose
-        # writes have not been submitted, and the layer produces garbage
-        # ('3 English, , 0'). Making it safe needs per-buffer submission
-        # tracking, not just the pack kernel -- the pack kernel removed the
-        # round trips but did not make the async ordering correct.
         note("matmul.q_proj")
-        q = self._lin_b(h, self._w["q"], self._zero_hd,
-                        self.num_heads * self.head_dim)
+        if use_q4:
+            q = keep(self._lin_b_q4(h, self._w_q4_buf["q"], self._zero_hd,
+                                self.num_heads * self.head_dim, self.hidden_size))
+        else:
+            q = keep(self._lin_b(h, self._w["q"], self._zero_hd,
+                            self.num_heads * self.head_dim))
         note("rmsnorm.q_norm")
-        # QK-norm normalises over head_dim, so the [M, n_heads*hd] buffer must be
-        # viewed as [M*n_heads, hd] first. `view()` reinterprets the same bytes.
         M = q.shape[0]
-        q = self._rms_b(q.view(M * self.num_heads, self.head_dim),
-                         self._w["q_norm"])
+        q = keep(self._rms_b(q.view(M * self.num_heads, self.head_dim),
+                         self._w["q_norm"]))
 
         note("matmul.k_proj")
-        k = self._lin_b(h, self._w["k"], self._zero_kvd,
-                        self.num_kv_heads * self.head_dim)
+        if use_q4:
+            k = keep(self._lin_b_q4(h, self._w_q4_buf["k"], self._zero_kvd,
+                                self.num_kv_heads * self.head_dim, self.hidden_size))
+        else:
+            k = keep(self._lin_b(h, self._w["k"], self._zero_kvd,
+                            self.num_kv_heads * self.head_dim))
         note("rmsnorm.k_norm")
-        k = self._rms_b(k.view(M * self.num_kv_heads, self.head_dim),
-                         self._w["k_norm"])
+        k = keep(self._rms_b(k.view(M * self.num_kv_heads, self.head_dim),
+                         self._w["k_norm"]))
 
         note("matmul.v_proj")
-        v = self._lin_b(h, self._w["v"], self._zero_kvd,
-                        self.num_kv_heads * self.head_dim)
+        if use_q4:
+            v = keep(self._lin_b_q4(h, self._w_q4_buf["v"], self._zero_kvd,
+                                self.num_kv_heads * self.head_dim, self.hidden_size))
+        else:
+            v = keep(self._lin_b(h, self._w["v"], self._zero_kvd,
+                            self.num_kv_heads * self.head_dim))
 
         # ---- RoPE on the packed [Q|K|V] buffer
         cos, sin = position_embeddings
@@ -404,42 +502,28 @@ class VulkanDecoderLayer(torch.nn.Module):
         pos_start = int(cache_position[0].item()) if cache_position is not None else 0
         HD = self.num_heads * self.head_dim
         KVD = self.num_kv_heads * self.head_dim
-        # q/k/v stay device-resident. Previously this was
-        #     q.cpu(); k.cpu(); v.cpu(); torch.cat([...]); _Buf(...)
-        # i.e. three device->host round trips plus three uploads, each carrying a
-        # `vkQueueWaitIdle`. The pack kernel replaces all of it with one dispatch.
         q_t = q.view(S, HD)
         k_t = k.view(S, KVD)
         v_t = v.view(S, KVD)
-        qkv = tvk.VkBuffer(max(1, S * (HD + 2 * KVD)) * 4, "device")
+        qkv = keep(tvk.VkBuffer(max(1, S * (HD + 2 * KVD)) * 4, "device"))
         tvk.dispatch(
             "pack3", [q_t.buf, k_t.buf, v_t.buf, qkv],
             u32(S) + u32(HD) + u32(KVD) + u32(KVD),
-            (S * (HD + 2 * KVD) + 63) // 64, 1, 1)
+            (S * (HD + 2 * KVD) + 63) // 64, 1, 1, sync=False)
         note("rope")
         tvk.rope_qkv(qkv, pos_start, self.num_heads,
-                     self.num_kv_heads, self.head_dim, n_tok=S)
+                     self.num_kv_heads, self.head_dim, n_tok=S, sync=False)
+        
+        # Submit before downloading qkv (needed for KV cache and attention)
+        tvk.submit()
+        
         qkv2 = qkv.download((S * (HD + 2 * KVD),))
         q = qkv2[:S * HD].view(S, self.num_heads, self.head_dim)
         k = qkv2[S * HD:S * HD + S * KVD].view(S, self.num_kv_heads, self.head_dim)
         v = qkv2[S * HD + S * KVD:S * HD + 2 * S * KVD].view(S, self.num_kv_heads,
                                                              self.head_dim)
 
-        # ---- KV cache update (original DynamicCache contract, CPU resident)
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # k/v are [S, n_kv, hd]; the cache wants [B, n_kv, S, hd].
-            k_cpu = k.permute(1, 0, 2).unsqueeze(0).to(layer_dtype)
-            v_cpu = v.permute(1, 0, 2).unsqueeze(0).to(layer_dtype)
-            if stats is not None:
-                stats.transfers += 2
-                stats.transfer_bytes += k_cpu.numel() * k_cpu.element_size() * 2
-            k, v = past_key_values.update(k_cpu, v_cpu, self.layer_idx, cache_kwargs)
-
         # ---- attention over the cache window
-        # k/v arrive as [S, n_kv, hd] straight from the projection. The cache
-        # (when present) stores them as [B, n_kv, L, hd]. Normalise BOTH to
-        # [n_kv, L, hd] so the kernel always sees the same layout.
         if past_key_values is None:
             k_c = k.permute(1, 0, 2).contiguous()
             v_c = v.permute(1, 0, 2).contiguous()
@@ -451,11 +535,7 @@ class VulkanDecoderLayer(torch.nn.Module):
         else:
             k_c, v_c = k[0], v[0]
         cap = k_c.shape[1]
-        # The kernel takes one query position per head. For a prefill of S tokens
-        # we attend each of them against the cache window and stack the results.
         n_q = S
-        # Causal mask over the window: query at absolute position p may attend
-        # keys up to p. Query i corresponds to absolute position pos_start + i.
         first_pos = pos_start
         q_pos = torch.arange(first_pos, first_pos + S)
         k_pos = torch.arange(cap)
@@ -464,24 +544,23 @@ class VulkanDecoderLayer(torch.nn.Module):
         mask = mask.masked_fill(~allow.unsqueeze(0).unsqueeze(0), float("-inf"))
         if os.environ.get("OFFLOAD_ZERO_MASK"):
             mask = torch.zeros(1, self.num_heads, n_q, cap)
-        probs = tvk.VkBuffer(max(1, self.num_heads * n_q * cap) * 4, "device")
-        ob = tvk.VkBuffer(max(1, self.num_heads * n_q * self.head_dim) * 4, "host")
+        probs = keep(tvk.VkBuffer(max(1, self.num_heads * n_q * cap) * 4, "device"))
+        ob = keep(tvk.VkBuffer(max(1, self.num_heads * n_q * self.head_dim) * 4, "host"))
         q_in = q.reshape(n_q, self.num_heads, self.head_dim).permute(1, 0, 2).contiguous()
-        kb = _Buf(k_c[:, :cap, :].contiguous())
-        vb = _Buf(v_c[:, :cap, :].contiguous())
+        kb = keep(_Buf(k_c[:, :cap, :].contiguous()))
+        vb = keep(_Buf(v_c[:, :cap, :].contiguous()))
         if stats is not None:
             stats.transfers += 2
             stats.transfer_bytes += (kb.buf.size + vb.buf.size)
         note("attention")
-        # Hold the temporaries: a `_Buf` freed before the GPU finishes reading
-        # leaves the kernel reading unmapped VA, which returns zeros rather
-        # than faulting. Submission is not completion.
-        _q_in = _Buf(q_in)
-        _mask = _Buf(mask)
+        _q_in = keep(_Buf(q_in))
+        _mask = keep(_Buf(mask))
         tvk.attention2(_q_in.buf, kb.buf, vb.buf, _mask.buf, probs, ob,
                        0, cap, self.num_heads,
                        self.num_heads // self.num_kv_heads, self.head_dim,
-                       cap, self.scaling)
+                       cap, self.scaling, sync=False)
+        # Submit before downloading attention output
+        tvk.submit()
         attn = ob.download((self.num_heads, n_q, self.head_dim))
         attn = attn.permute(1, 0, 2).reshape(n_q, HD)
         if stats is not None:
@@ -491,7 +570,12 @@ class VulkanDecoderLayer(torch.nn.Module):
         # ---- output projection + residual
         note("matmul.o_proj")
         attn_t = attn.contiguous()
-        out = self._lin(attn_t, self._w["o"], self._zero_h, self.hidden_size)
+        if use_q4:
+            out = self._lin_b_q4(attn_t, self._w_q4_buf["o"], self._zero_h,
+                                  self.hidden_size, self.hidden_size).cpu().reshape(
+                attn_t.shape[:-1] + (self.hidden_size,))
+        else:
+            out = self._lin(attn_t, self._w["o"], self._zero_h, self.hidden_size)
         h = hidden_states + out.to(layer_dtype)
         residual = h
 
@@ -499,14 +583,21 @@ class VulkanDecoderLayer(torch.nn.Module):
         note("rmsnorm.post_attn")
         h2 = self._rms(h.detach().to(torch.float32), self._w["post_ln"])
         note("fused_gate_up")
-        gu = _Buf.out((S, self.config.intermediate_size))
-        _h2 = _Buf(h2)
+        gu = keep(_Buf.out((S, self.config.intermediate_size)))
+        _h2 = keep(_Buf(h2))
         tvk.fused_gate_up(_h2.buf, self._w["gate_up"].buf, gu.buf,
                           S, self.hidden_size, self.config.intermediate_size,
-                          )
+                          sync=False)
+        # Submit before downloading gate_up output
+        tvk.submit()
         gu_t = gu.cpu()
         note("matmul.down_proj")
-        mlp = self._lin(gu_t, self._w["down"], self._zero_h, self.hidden_size)
+        if use_q4:
+            mlp = self._lin_b_q4(gu_t, self._w_q4_buf["down"], self._zero_h,
+                                  self.hidden_size, self.config.intermediate_size).cpu().reshape(
+                gu_t.shape[:-1] + (self.hidden_size,))
+        else:
+            mlp = self._lin(gu_t, self._w["down"], self._zero_h, self.hidden_size)
         h = residual + mlp.to(layer_dtype)
 
         if stats is not None:
@@ -531,23 +622,24 @@ class HybridBackbone(torch.nn.Module):
         self.placement = placement
 
         self.layers = torch.nn.ModuleList()
+        gpu_layer_indices = []
         for i, orig in enumerate(qwen3_model.layers):
             if placement.device_of(i) == "vulkan":
                 vl = VulkanDecoderLayer(self.config, i)
                 vl.load_state_dict(orig.state_dict(), strict=True)
                 self.layers.append(vl)
+                gpu_layer_indices.append(i)
             else:
                 self.layers.append(orig)
 
-        placement.layers_on_gpu = len(
-            [i for i in range(len(qwen3_model.layers))
-             if placement.device_of(i) == "vulkan"])
-        placement.layers_on_cpu = len(qwen3_model.layers) - placement.layers_on_gpu
+        self.placement_gpu_layers = len(gpu_layer_indices)
+        self.placement_cpu_layers = len(qwen3_model.layers) - self.placement_gpu_layers
 
     def forward(self, input_ids=None, inputs_embeds=None, position_ids=None,
                 past_key_values=None, attention_mask=None, use_cache=True,
                 cache_position=None, output_hidden_states=False,
-                return_dict=True, logits_to_keep=0, stats=None, **kwargs):
+                return_dict=True, logits_to_keep=0, stats=None, use_q4: bool = False,
+                **kwargs):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -577,16 +669,29 @@ class HybridBackbone(torch.nn.Module):
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden = all_hidden + (hidden,)
-            hidden = layer(
-                hidden,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                stats=stats,
-            )
+            if isinstance(layer, VulkanDecoderLayer):
+                hidden = layer(
+                    hidden,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    stats=stats,
+                    use_q4=use_q4,
+                )
+            else:
+                hidden = layer(
+                    hidden,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    stats=stats,
+                )
 
         hidden = self.norm(hidden)
         if output_hidden_states:

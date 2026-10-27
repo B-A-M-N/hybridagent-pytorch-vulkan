@@ -13,36 +13,8 @@ Backend& Backend::instance() {
   return b;
 }
 
-uint32_t Backend::find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props) {
-  VkPhysicalDeviceMemoryProperties mp;
-  vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
-  for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
-    if ((type_bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) {
-      return i;
-    }
-  }
-  throw std::runtime_error("[tvk] no Vulkan memory type for flags " +
-                           std::to_string((uint32_t)props));
-}
-
-uint64_t Backend::vram_total() const {
-  VkPhysicalDeviceMemoryProperties mp;
-  vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
-  for (uint32_t h = 0; h < mp.memoryHeapCount; h++) {
-    if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-      return mp.memoryHeaps[h].size;
-    }
-  }
-  return mp.memoryHeapCount ? mp.memoryHeaps[0].size : 0;
-}
-
-uint64_t Backend::vram_used() const {
-  std::lock_guard<std::mutex> lk(mutex_);
-  return bytes_;
-}
-
 bool Backend::init(uint32_t device_index) {
-  std::lock_guard<std::mutex> lk(mutex_);
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
   if (ready_) return true;
 
   VkApplicationInfo app{};
@@ -117,167 +89,156 @@ bool Backend::init(uint32_t device_index) {
   return true;
 }
 
-std::vector<uint32_t> Backend::load_shader_unlocked(const std::string& name) {
-  auto it = shader_cache_.find(name);
-  if (it != shader_cache_.end()) return it->second;
-  std::string path = shader_dir_ + name + ".spv";
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f.is_open()) {
-    throw std::runtime_error("[tvk] cannot open shader " + path);
+Allocation::~Allocation() {
+  if (backend && buffer != VK_NULL_HANDLE) {
+    try {
+      backend->destroy_allocation(this);
+    } catch (...) {}
   }
-  size_t bytes = (size_t)f.tellg();
-  f.seekg(0);
-  std::vector<uint32_t> spv(bytes / 4);
-  f.read(reinterpret_cast<char*>(spv.data()), bytes);
-  shader_cache_[name] = spv;
-  return spv;
 }
 
-std::vector<uint32_t> Backend::load_shader(const std::string& name) {
-  std::lock_guard<std::mutex> lk(mutex_);
-  return load_shader_unlocked(name);
+uint32_t Backend::find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props) {
+  VkPhysicalDeviceMemoryProperties mp;
+  vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+  for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+    if ((type_bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) {
+      return i;
+    }
+  }
+  throw std::runtime_error("[tvk] no Vulkan memory type for flags " +
+                           std::to_string((uint32_t)props));
 }
 
-Buffer Backend::create_device_buffer(VkDeviceSize size) {
-  std::lock_guard<std::mutex> lk(mutex_);
+uint64_t Backend::vram_total() const {
+  VkPhysicalDeviceMemoryProperties mp;
+  vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+  for (uint32_t h = 0; h < mp.memoryHeapCount; h++) {
+    if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+      return mp.memoryHeaps[h].size;
+    }
+  }
+  return mp.memoryHeapCount ? mp.memoryHeaps[0].size : 0;
+}
+
+uint64_t Backend::vram_used() const {
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
+  return bytes_;
+}
+
+Allocation* Backend::create_device_allocation(VkDeviceSize size) {
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
   VkBufferCreateInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   bi.size = size;
   bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
              VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
   bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  Buffer b;
-  if (vkCreateBuffer(device_, &bi, nullptr, &b.buffer) != VK_SUCCESS) {
+  VkBuffer buf;
+  if (vkCreateBuffer(device_, &bi, nullptr, &buf) != VK_SUCCESS) {
     throw std::runtime_error("[tvk] vkCreateBuffer failed (" +
                              std::to_string(size) + " bytes)");
   }
   VkMemoryRequirements req;
-  vkGetBufferMemoryRequirements(device_, b.buffer, &req);
+  vkGetBufferMemoryRequirements(device_, buf, &req);
   VkMemoryAllocateInfo ai{};
   ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   ai.allocationSize = req.size;
   ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (vkAllocateMemory(device_, &ai, nullptr, &b.memory) != VK_SUCCESS) {
+  VkDeviceMemory mem;
+  if (vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) {
+    vkDestroyBuffer(device_, buf, nullptr);
     throw std::runtime_error("[tvk] vkAllocateMemory failed (device-local)");
   }
-  vkBindBufferMemory(device_, b.buffer, b.memory, 0);
-  b.size = size;
+  vkBindBufferMemory(device_, buf, mem, 0);
   bytes_ += req.size;
-  return b;
+  Allocation* a = new Allocation(buf, mem, req.size, this);
+  live_allocs_.push_back(a);
+  return a;
 }
 
-Buffer Backend::create_host_buffer(VkDeviceSize size) {
-  std::lock_guard<std::mutex> lk(mutex_);
+Allocation* Backend::create_host_allocation(VkDeviceSize size) {
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
   VkBufferCreateInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   bi.size = size;
   bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  Buffer b;
-  if (vkCreateBuffer(device_, &bi, nullptr, &b.buffer) != VK_SUCCESS) {
+  VkBuffer buf;
+  if (vkCreateBuffer(device_, &bi, nullptr, &buf) != VK_SUCCESS) {
     throw std::runtime_error("[tvk] vkCreateBuffer(host) failed");
   }
   VkMemoryRequirements req;
-  vkGetBufferMemoryRequirements(device_, b.buffer, &req);
+  vkGetBufferMemoryRequirements(device_, buf, &req);
   VkMemoryAllocateInfo ai{};
   ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   ai.allocationSize = req.size;
   ai.memoryTypeIndex = find_memory_type(
       req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-  if (vkAllocateMemory(device_, &ai, nullptr, &b.memory) != VK_SUCCESS) {
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  VkDeviceMemory mem;
+  if (vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) {
+    vkDestroyBuffer(device_, buf, nullptr);
     throw std::runtime_error("[tvk] vkAllocateMemory failed (host)");
   }
-  vkBindBufferMemory(device_, b.buffer, b.memory, 0);
-  b.size = size;
-  return b;
+  vkBindBufferMemory(device_, buf, mem, 0);
+  Allocation* a = new Allocation(buf, mem, req.size, this);
+  live_allocs_.push_back(a);
+  return a;
 }
 
-void* Backend::map(Buffer& b) {
+void Backend::destroy_allocation(Allocation* a) {
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
+  if (!a) return;
+  alloc_gen_++;
+  if (a->memory != VK_NULL_HANDLE) {
+    vkFreeMemory(device_, a->memory, nullptr);
+    a->memory = VK_NULL_HANDLE;
+  }
+  if (a->buffer != VK_NULL_HANDLE) {
+    vkDestroyBuffer(device_, a->buffer, nullptr);
+    a->buffer = VK_NULL_HANDLE;
+  }
+  if (a->size > 0) bytes_ -= a->size;
+  // Unregister so the Backend destructor does not free it a second time.
+  // The slot is nulled, not erased: erasing would invalidate an iterator
+  // if this runs during the Backend destructor's own loop over live_allocs_.
+  for (size_t i = 0; i < live_allocs_.size(); i++) {
+    if (live_allocs_[i] == a) {
+      live_allocs_[i] = nullptr;
+      break;
+    }
+  }
+}
+
+BufferView Backend::make_view(Allocation* alloc, VkDeviceSize offset, VkDeviceSize size) {
+  if (!alloc) return BufferView{};
+  alloc->add_ref();
+  return BufferView(alloc, offset, size);
+}
+
+void Backend::release_view(Allocation* alloc) {
+  if (alloc) alloc->release();
+}
+
+void* Backend::map(Allocation* alloc) {
+  if (!alloc) return nullptr;
   void* p = nullptr;
-  vkMapMemory(device_, b.memory, 0, b.size, 0, &p);
+  vkMapMemory(device_, alloc->memory, 0, alloc->size, 0, &p);
   return p;
 }
 
-void Backend::unmap(Buffer& b) {
-  if (b.memory != VK_NULL_HANDLE) vkUnmapMemory(device_, b.memory);
-}
-
-void Backend::destroy_buffer(Buffer& b) {
-  std::lock_guard<std::mutex> lk(mutex_);
-  alloc_gen_++;
-  if (b.memory != VK_NULL_HANDLE) {
-    vkFreeMemory(device_, b.memory, nullptr);
-    b.memory = VK_NULL_HANDLE;
-  }
-  if (b.buffer != VK_NULL_HANDLE) {
-    vkDestroyBuffer(device_, b.buffer, nullptr);
-    b.buffer = VK_NULL_HANDLE;
+void Backend::unmap(Allocation* alloc) {
+  if (alloc && alloc->memory != VK_NULL_HANDLE) {
+    vkUnmapMemory(device_, alloc->memory);
   }
 }
-
-void Backend::ensure_cmd() {
-  if (cmd_ != VK_NULL_HANDLE) return;
-  VkCommandBufferAllocateInfo ai{};
-  ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  ai.commandPool = cmd_pool_;
-  ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  ai.commandBufferCount = 1;
-  vkAllocateCommandBuffers(device_, &ai, &cmd_);
-}
-
-void Backend::copy_to_device(Buffer& dst, Buffer& src) {
-  std::lock_guard<std::mutex> lk(mutex_);
-  ensure_cmd();
-  VkCommandBufferBeginInfo bi{};
-  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(cmd_, &bi);
-  VkBufferCopy r{};
-  r.srcOffset = 0;
-  r.dstOffset = 0;
-  r.size = std::min(dst.size, src.size);
-  vkCmdCopyBuffer(cmd_, src.buffer, dst.buffer, 1, &r);
-  vkEndCommandBuffer(cmd_);
-  VkSubmitInfo si{};
-  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  si.commandBufferCount = 1;
-  si.pCommandBuffers = &cmd_;
-  vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-  vkQueueWaitIdle(queue_);
-  vkResetCommandBuffer(cmd_, 0);
-}
-
-void Backend::copy_from_device(Buffer& dst, Buffer& src) {
-  std::lock_guard<std::mutex> lk(mutex_);
-  ensure_cmd();
-  VkCommandBufferBeginInfo bi{};
-  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(cmd_, &bi);
-  VkBufferCopy r{};
-  r.srcOffset = 0;
-  r.dstOffset = 0;
-  r.size = std::min(dst.size, src.size);
-  vkCmdCopyBuffer(cmd_, src.buffer, dst.buffer, 1, &r);
-  vkEndCommandBuffer(cmd_);
-  VkSubmitInfo si{};
-  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  si.commandBufferCount = 1;
-  si.pCommandBuffers = &cmd_;
-  vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-  vkQueueWaitIdle(queue_);
-  vkResetCommandBuffer(cmd_, 0);
-}
-
-
 
 void Backend::dispatch(const std::string& shader,
-                       const std::vector<VkBuffer>& buffers,
+                       const std::vector<BufferView>& views,
                        const void* push, uint32_t push_size,
                        uint32_t gx, uint32_t gy, uint32_t gz, bool sync) {
-  std::lock_guard<std::mutex> lk(mutex_);
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
   if (!ready_) throw std::runtime_error("[tvk] backend not initialised");
 
   Pipeline* p = nullptr;
@@ -294,12 +255,9 @@ void Backend::dispatch(const std::string& shader,
       if (vkCreateShaderModule(device_, &smi, nullptr, &sm) != VK_SUCCESS) {
         throw std::runtime_error("[tvk] vkCreateShaderModule failed: " + shader);
       }
-      // The shader may declare more bindings than this dispatch passes (e.g.
-      // scratch buffers). Allocate for the shader's own count, otherwise RADV
-      // returns undefined results instead of an error.
       uint32_t n_decl = (uint32_t)spirv_max_binding(spv);
-      if (n_decl == 0u) n_decl = (uint32_t)buffers.size();
-      uint32_t n_to_bind = (uint32_t)buffers.size();
+      if (n_decl == 0u) n_decl = (uint32_t)views.size();
+      uint32_t n_to_bind = (uint32_t)views.size();
       if (n_decl < n_to_bind) n_decl = n_to_bind;
 
       std::vector<VkDescriptorSetLayoutBinding> binds;
@@ -336,10 +294,6 @@ void Backend::dispatch(const std::string& shader,
         throw std::runtime_error("[tvk] pipeline layout failed: " + shader);
       }
       VkDescriptorPoolSize dps{};
-      // The pool must be able to hold `maxSets` sets, each of which consumes
-      // `n_decl` storage-buffer descriptors. Sizing this as n_decl*4 while
-      // declaring maxSets=4096 exhausted the pool after 4 sets and produced
-      // VK_ERROR_OUT_OF_POOL_MEMORY partway through a forward pass.
       dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       dps.descriptorCount = n_decl * max_desc_sets_;
       VkDescriptorPoolCreateInfo dpi{};
@@ -365,7 +319,7 @@ void Backend::dispatch(const std::string& shader,
         throw std::runtime_error("[tvk] compute pipeline failed: " + shader);
       }
       std::cerr << "[tvk] pipeline '" << shader << "' declared bindings="
-                << n_decl << " passed=" << n_to_bind << "\n";
+                << n_decl << " passed=" << views.size() << "\n";
       np.layout = pl;
       np.dsl = dsl;
       np.pool = pool;
@@ -379,12 +333,8 @@ void Backend::dispatch(const std::string& shader,
   }
 
   auto& bnd = bound_[shader];
-  // Rebind when the buffer list changed. The descriptor set is NOT freed and
-  // re-allocated: a previously queued (async) dispatch may still reference it,
-  // and freeing it under the GPU corrupts results and can lose the context.
-  // A new set is allocated instead, so in-flight work keeps its own.
-  bool need = bnd.set == VK_NULL_HANDLE || bnd.buffers != buffers ||
-              bnd.n != buffers.size();
+  bool need = bnd.set == VK_NULL_HANDLE || bnd.views != views ||
+              views.size() != bnd.views.size();
   if (need) {
     VkDescriptorSetAllocateInfo ai{};
     ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -396,12 +346,12 @@ void Backend::dispatch(const std::string& shader,
     }
     bnd.gen = alloc_gen_;
     bnd.live = true;
-    std::vector<VkWriteDescriptorSet> w(buffers.size());
-    std::vector<VkDescriptorBufferInfo> infos(buffers.size());
-    for (size_t i = 0; i < buffers.size(); i++) {
-      infos[i].buffer = buffers[i];
-      infos[i].offset = 0;
-      infos[i].range = VK_WHOLE_SIZE;
+    std::vector<VkWriteDescriptorSet> w(views.size());
+    std::vector<VkDescriptorBufferInfo> infos(views.size());
+    for (size_t i = 0; i < views.size(); i++) {
+      infos[i].buffer = views[i].vk_buffer();
+      infos[i].offset = views[i].vk_offset();
+      infos[i].range = views[i].vk_size();
       w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       w[i].dstSet = bnd.set;
       w[i].dstBinding = (uint32_t)i;
@@ -410,62 +360,70 @@ void Backend::dispatch(const std::string& shader,
       w[i].pBufferInfo = &infos[i];
     }
     vkUpdateDescriptorSets(device_, (uint32_t)w.size(), w.data(), 0, nullptr);
-    bnd.buffers = buffers;
-    bnd.n = (uint32_t)buffers.size();
+    bnd.views = views;
     bnd.gen = alloc_gen_;
   }
 
-  ensure_cmd();
+  // For async dispatches, allocate a new command buffer to avoid reusing
+  // the command buffer while the GPU is still executing the previous dispatch.
+  VkCommandBuffer cmd = cmd_;
+  bool new_cmd = false;
+  if (!sync) {
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = cmd_pool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) {
+      throw std::runtime_error("[tvk] vkAllocateCommandBuffers failed");
+    }
+    new_cmd = true;
+  } else {
+    ensure_cmd();
+  }
 
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  vkBeginCommandBuffer(cmd_, &bi);
-  vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
-  vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p->layout, 0, 1,
+  vkBeginCommandBuffer(cmd, &bi);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p->layout, 0, 1,
                           &bnd.set, 0, nullptr);
   if (push_size) {
-    vkCmdPushConstants(cmd_, p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size,
+    vkCmdPushConstants(cmd, p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size,
                        push);
   }
-  // Flatten a 3-D grid into 1-D. RADV on this driver ignores the Y and Z
-  // components of vkCmdDispatch for compute pipelines in a way that silently
-  // collapses multi-row grids to a single workgroup, so every dispatch goes out
-  // as (gx*gy*gz, 1, 1) and each shader derives its own 2-D/3-D indices from
-  // gl_WorkGroupID.x. See dispatch_linear() in vk_cabi.cpp.
-  vkCmdDispatch(cmd_, gx * gy * gz, 1, 1);
-  vkEndCommandBuffer(cmd_);
+  vkCmdDispatch(cmd, gx * gy * gz, 1, 1);
+  vkEndCommandBuffer(cmd);
 
-  // Submit whatever has accumulated. `sync == true` waits for the queue to go
-  // idle so the caller can read results immediately; `sync == false` leaves the
-  // work queued so several dispatches can be submitted as one batch.
-  //
-  // The command buffer may only be RESET once the GPU has finished with it.
-  // Resetting it while a previous async submission is still executing is what
-  // produced `GPUVM fault` / `context is lost` -- submission is not completion.
+  // Create a submission record that retains all allocations used by this dispatch.
+  // These allocations will be released when the GPU completes (in submit() or sync dispatch).
+  Submission sub;
+  sub.views = views;
+  sub.cmd = cmd;
+  sub.new_cmd = new_cmd;
+  for (const auto& v : views) {
+    if (v.alloc) {
+      v.alloc->add_ref();
+      sub.retained_allocs.push_back(v.alloc);
+    }
+  }
+  sub.set = bnd.set;
+  pending_submissions_.push_back(std::move(sub));
+
   VkSubmitInfo si{};
   si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   si.commandBufferCount = 1;
-  si.pCommandBuffers = &cmd_;
+  si.pCommandBuffers = &cmd;
   vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
   if (sync) {
     vkQueueWaitIdle(queue_);
-    vkResetCommandBuffer(cmd_, 0);
-    cmd_inflight_ = false;
-    // The queue has drained, so the descriptor sets allocated for this
-    // dispatch are no longer referenced by in-flight work. Free them here --
-    // otherwise they accumulate one per dispatch until the pool is exhausted,
-    // after which vkAllocateDescriptorSets fails and leaves the command buffer
-    // mid-record. That exhaustion is the source of the intermittent corruption
-    // and the SIGSEGV.
-    for (auto& kv : bound_) {
-      auto& b = kv.second;
-      if (b.live && b.set != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(device_, pipelines_[kv.first].pool, 1, &b.set);
-        b.set = VK_NULL_HANDLE;
-        b.live = false;
-        b.buffers.clear();
-        b.n = 0;
-      }
+    if (new_cmd) {
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+    } else {
+      // For sync dispatches, DON'T reset the command buffer or free descriptor sets.
+      // Keep them for reuse in the next dispatch with the same shader and bindings.
+      // Only mark that no command is in flight.
+      cmd_inflight_ = false;
     }
   } else {
     cmd_inflight_ = true;
@@ -474,33 +432,138 @@ void Backend::dispatch(const std::string& shader,
 }
 
 void Backend::submit() {
-  std::lock_guard<std::mutex> lk(mutex_);
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
   if (device_ == VK_NULL_HANDLE) return;
   if (cmd_inflight_) {
-    // The previous async submission must complete before the command buffer can
-    // be reset and reused.
     vkQueueWaitIdle(queue_);
     vkResetCommandBuffer(cmd_, 0);
     cmd_inflight_ = false;
   }
-  // The queue has drained, so every descriptor set allocated for queued work is
-  // now free to reuse. Recycle them instead of leaking a set per dispatch --
-  // without this the pool is exhausted after a few hundred dispatches.
-  for (auto& kv : bound_) {
-    auto& b = kv.second;
-    if (b.live && b.set != VK_NULL_HANDLE) {
-      vkFreeDescriptorSets(device_, pipelines_[kv.first].pool, 1, &b.set);
-      b.set = VK_NULL_HANDLE;
-      b.live = false;
-      b.buffers.clear();
-      b.n = 0;
+  // NOTE: We DON'T free descriptor sets here - they are cached per shader for reuse.
+  // Only free command buffers that were allocated for async dispatches.
+  for (auto& sub : pending_submissions_) {
+    for (auto* alloc : sub.retained_allocs) {
+      if (alloc) alloc->release();
+    }
+    if (sub.new_cmd && sub.cmd != VK_NULL_HANDLE) {
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &sub.cmd);
     }
   }
+  pending_submissions_.clear();
+}
+
+void Backend::copy_to_device(Allocation* dst, Allocation* src) {
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
+  ensure_cmd();
+  VkCommandBufferBeginInfo bi{};
+  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd_, &bi);
+  VkBufferCopy r{};
+  r.srcOffset = 0;
+  r.dstOffset = 0;
+  r.size = std::min(dst->size, src->size);
+  vkCmdCopyBuffer(cmd_, src->buffer, dst->buffer, 1, &r);
+  vkEndCommandBuffer(cmd_);
+  VkSubmitInfo si{};
+  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd_;
+  vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+  vkQueueWaitIdle(queue_);
+  vkResetCommandBuffer(cmd_, 0);
+}
+
+void Backend::copy_from_device(Allocation* dst, Allocation* src) {
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
+  ensure_cmd();
+  VkCommandBufferBeginInfo bi{};
+  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd_, &bi);
+  VkBufferCopy r{};
+  r.srcOffset = 0;
+  r.dstOffset = 0;
+  r.size = std::min(dst->size, src->size);
+  vkCmdCopyBuffer(cmd_, src->buffer, dst->buffer, 1, &r);
+  vkEndCommandBuffer(cmd_);
+  VkSubmitInfo si{};
+  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd_;
+  vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+  vkQueueWaitIdle(queue_);
+  vkResetCommandBuffer(cmd_, 0);
+}
+
+std::vector<uint32_t> Backend::load_shader(const std::string& name) {
+  std::lock_guard<std::recursive_mutex> lk(mutex_);
+  return load_shader_unlocked(name);
+}
+
+std::vector<uint32_t> Backend::load_shader_unlocked(const std::string& name) {
+  auto it = shader_cache_.find(name);
+  if (it != shader_cache_.end()) return it->second;
+  std::string path = shader_dir_ + name + ".spv";
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f.is_open()) {
+    throw std::runtime_error("[tvk] cannot open shader " + path);
+  }
+  size_t bytes = (size_t)f.tellg();
+  f.seekg(0);
+  std::vector<uint32_t> spv(bytes / 4);
+  f.read(reinterpret_cast<char*>(spv.data()), bytes);
+  shader_cache_[name] = spv;
+  return spv;
+}
+
+void Backend::ensure_cmd() {
+  if (cmd_ != VK_NULL_HANDLE) return;
+  VkCommandBufferAllocateInfo ai{};
+  ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  ai.commandPool = cmd_pool_;
+  ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  ai.commandBufferCount = 1;
+  vkAllocateCommandBuffers(device_, &ai, &cmd_);
 }
 
 Backend::~Backend() {
   if (device_ == VK_NULL_HANDLE) return;
   vkDeviceWaitIdle(device_);
+  // Free every still-live Allocation BEFORE destroying the device.
+  //
+  // ~Allocation -> destroy_allocation() calls vkFreeMemory/vkDestroyBuffer
+  // on device_. If an Allocation outlives the Backend (the usual case: the
+  // Python objects are garbage-collected after the backend singleton is torn
+  // down at interpreter exit), that call runs against a DESTROYED device and
+  // the driver reports:
+  //     ERROR: vkFreeMemory: Invalid device [VUID-vkFreeMemory-device-parameter]
+  // Freeing them here, while the device is still valid, removes that error
+  // and the resulting leak.
+  for (size_t i = 0; i < live_allocs_.size(); i++) {
+    Allocation* alloc = live_allocs_[i];
+    if (!alloc) continue;
+    // Stop the destructor from calling back into destroy_allocation().
+    alloc->backend = nullptr;
+    // Release the Vulkan resources while the device is still valid.
+    //
+    // NOTE: do NOT `delete alloc` here. The Allocation is reference counted and
+    // Python may still hold BufferView references to it. Deleting it now would
+    // let the last view's release() call `delete this` a second time, which
+    // is a double-free (heap corruption). The object is freed by its own
+    // refcount when the last view goes away.
+    if (alloc->memory != VK_NULL_HANDLE) {
+      vkFreeMemory(device_, alloc->memory, nullptr);
+      alloc->memory = VK_NULL_HANDLE;
+    }
+    if (alloc->buffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(device_, alloc->buffer, nullptr);
+      alloc->buffer = VK_NULL_HANDLE;
+    }
+    if (alloc->size > 0) bytes_ -= alloc->size;
+    alloc->size = 0;
+  }
+  live_allocs_.clear();
   for (auto& kv : pipelines_) {
     vkDestroyPipeline(device_, kv.second.pipeline, nullptr);
     vkDestroyPipelineLayout(device_, kv.second.layout, nullptr);

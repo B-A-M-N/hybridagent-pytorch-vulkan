@@ -23,6 +23,7 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint total = params.rows * params.cols;
 
+    // Each thread finds its local max among elements it processes
     float best = -3.4e38;
     uint best_i = 0u;
     for (uint i = tid; i < total; i += 256u) {
@@ -33,11 +34,27 @@ void main() {
     s_idx[tid] = best_i;
     barrier();
 
+    // Tree reduction: each step halves the active threads.
+    //
+    // TIE-BREAK: on equal values, the LOWER index must win, to match
+    // torch.argmax (which returns the first occurrence of the maximum).
+    // The naive `s_val[tid + s] > s_val[tid]` takes the HIGHER index on a tie
+    // because tid + s > tid, so the winner is the last occurrence instead of
+    // the first. That is a real semantic difference from torch.argmax, not a
+    // cosmetic one: it changes which token is sampled.
+    //
+    // The condition below therefore compares values first and falls back to
+    // the index, so the smallest index survives every merge.
     for (uint s = 128u; s > 0u; s >>= 1u) {
         if (tid < s) {
-            if (s_val[tid + s] > s_val[tid]) {
-                s_val[tid] = s_val[tid + s];
-                s_idx[tid] = s_idx[tid + s];
+            float lhs_v = s_val[tid];
+            float rhs_v = s_val[tid + s];
+            uint  lhs_i = s_idx[tid];
+            uint  rhs_i = s_idx[tid + s];
+            bool take_rhs = (rhs_v > lhs_v) || (rhs_v == lhs_v && rhs_i < lhs_i);
+            if (take_rhs) {
+                s_val[tid] = rhs_v;
+                s_idx[tid] = rhs_i;
             }
         }
         barrier();
