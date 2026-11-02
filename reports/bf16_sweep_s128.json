@@ -1,0 +1,44 @@
+{
+  "seq_len": 128,
+  "results": [
+    {
+      "gpu_layers": 0,
+      "ms": null,
+      "error": "FAILED: "
+    },
+    {
+      "gpu_layers": 1,
+      "ms": null,
+      "error": "FAILED: "
+    },
+    {
+      "gpu_layers": 2,
+      "ms": null,
+      "error": "FAILED: "
+    },
+    {
+      "gpu_layers": 3,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    },
+    {
+      "gpu_layers": 4,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    },
+    {
+      "gpu_layers": 5,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    },
+    {
+      "gpu_layers": 6,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    }
+  ]
+}

@@ -261,13 +261,16 @@ class BufferView:
             end = start + self.size // 4
             return torch.from_numpy(arr[start:end].copy()).reshape(shape).to(dtype)
         
-        # For device allocations, we need to stage through a host buffer
-        stage = Allocation(self.size, "host")
+        # For device allocations, stage through a PERSISTENT host buffer.
+        # Allocating a fresh host allocation per download caused vkAllocateMemory/
+        # vkFreeMemory churn on every device->host read (several per layer per
+        # step); the pool is keyed by size and reused. Downloads are synchronous,
+        # so reuse is safe.
+        stage_view = _staging(self.size)
         lib = _load()
-        if lib.tvk_copy_from_device(stage._h, self._alloc._h) != 0:
+        # tvk_copy_* take *Allocation* handles, not BufferView handles.
+        if lib.tvk_copy_from_device(stage_view._alloc._h, self._alloc._h) != 0:
             raise RuntimeError("tvk_copy_from_device failed")
-        # Create a view of the staging allocation to access mapped memory
-        stage_view = stage.view()
         raw = (ctypes.c_char * self.size).from_address(stage_view.mapped)
         if dtype == torch.int64 or dtype == torch.uint32:
             arr = np.frombuffer(bytes(bytearray(raw)), dtype=np.uint32)
@@ -489,6 +492,21 @@ def matmul(a: BufferView, b: BufferView, out: BufferView, M: int, K: int, N: int
     push = u32(M) + u32(K) + u32(N)
     dispatch("matmul", [a, b, out], push, (N + 15) // 16, (M + 15) // 16, 1, sync=sync)
 
+
+def gemv(a: BufferView, x: BufferView, y: BufferView, M: int, K: int, group_size: int = 128,
+           sync: bool = True) -> None:
+    """GEMV: y[M] = A[M, K] @ x[K] with symmetric 4-bit quantized x.
+    
+    A: fp32 matrix [M, K]
+    x: packed uint [K] with fp16 scale per group of group_size elements
+    y: fp32 output [M]
+    
+    row_stride = (K // group_size) * (group_size // 2 + 2)  # bytes per row
+    """
+    tiles_x = (K + 15) // 16  # TILE = 16
+    row_stride = (K // group_size) * (group_size // 2 + 2)
+    push = u32(M) + u32(K) + u32(tiles_x) + u32(group_size) + u32(row_stride)
+    dispatch("gemv_q4", [a, x, y], push, (M + 15) // 16, 1, 1, sync=sync)
 
 def matmul_t_bias(x: BufferView, w: BufferView, bias: BufferView, out: BufferView,
                   M: int, K: int, N: int, sync: bool = True) -> None:

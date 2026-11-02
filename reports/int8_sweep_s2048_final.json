@@ -1,0 +1,40 @@
+{
+  "seq_len": 2048,
+  "results": [
+    {
+      "gpu_layers": 0,
+      "ms": 48136.40,
+      "error": null
+    },
+    {
+      "gpu_layers": 1,
+      "ms": 47955.17,
+      "error": null
+    },
+    {
+      "gpu_layers": 2,
+      "ms": 49715.32,
+      "error": null
+    },
+    {
+      "gpu_layers": 3,
+      "ms": 50631.49,
+      "error": null
+    },
+    {
+      "gpu_layers": 4,
+      "ms": 50790.05,
+      "error": null
+    },
+    {
+      "gpu_layers": 5,
+      "ms": 53783.47,
+      "error": null
+    },
+    {
+      "gpu_layers": 6,
+      "ms": 47955.17,
+      "error": null
+    }
+  ]
+}

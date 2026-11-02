@@ -1,0 +1,100 @@
+#version 450
+// Weight-only Quantized Matrix-Vector Multiply (GEMV) -- symmetric 4-bit, one fp16 scale per group.
+// 
+//   y[M] = W[M, K] @ x[K]
+// 
+// `W` is packed Q4 weight matrix [M, K], one fp16 scale per group of group_size elements.
+// `x` is fp32 activation vector [K].
+// `y` is fp32 output vector [M].
+// 
+// Packing format (matches quantize_q4.py):
+//   group_bytes = group_size/2 + 2   (2 bytes fp16 scale, then group_size/2 bytes of nibbles)
+//   row_stride  = (K / group_size) * group_bytes
+//   quant: q = clamp(round(w/scale), -8, 7) + 8  => q in [0, 15]
+//   dequant: w ~= (q - 8) * scale
+//   nibble ordering: low nibble = even index, high nibble = odd index
+
+layout(local_size_x = 16) in;
+
+layout(set = 0, binding = 0) buffer BufW { uint w[]; };  // Packed Q4 weight matrix [M, K]
+layout(set = 0, binding = 1) buffer BufX { float x[]; }; // FP32 activation vector [K]
+layout(set = 0, binding = 2) buffer BufY { float y[]; }; // FP32 output vector [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;              // Number of output rows
+    uint K;              // Number of columns
+    uint group_size;     // Quantization group size (128)
+    uint row_stride;     // Bytes per row in packed W buffer
+} params;
+
+#define TILE 16
+
+// Extract byte from packed uint array
+uint byte_at(uint i) {
+    uint word = w[i / 4u];
+    return (word >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+// Convert fp16 to float
+float half_to_float(uint h) {
+    uint sgn = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1Fu;
+    uint man = h & 0x3FFu;
+    float v;
+    if (exp == 0u)       v = float(man) * 5.9604644775390625e-8;
+    else if (exp == 31u) v = (man == 0u) ? 1.0 / 0.0 : 0.0;
+    else                 v = float(man | 0x400u) * exp2(float(int(exp) - 25));
+    return (sgn == 1u) ? -v : v;
+}
+
+void main() {
+    uint global_idx = gl_WorkGroupID.x * TILE + gl_LocalInvocationID.x;
+    if (global_idx >= params.M) return;
+
+    uint row = global_idx;
+    uint gs = params.group_size;
+    uint group_bytes = gs / 2u + 2u;  // 2 bytes scale + gs/2 bytes of nibbles
+    uint kg = params.K / gs;
+
+    float acc = 0.0;
+
+    // Walk K in chunks matching the tile size for coalesced access
+    for (uint t0 = 0u; t0 < params.K; t0 += TILE) {
+        uint t_end = min(t0 + TILE, params.K);
+        
+        // Process each group that overlaps with this tile
+        for (uint g = 0u; g < kg; ++g) {
+            uint g_start = g * params.group_size;
+            uint g_end = g_start + params.group_size;
+            
+            if (g_end <= t0 || g_start >= t_end) continue;
+            
+            uint goff_start = max(t0, g_start) - g_start;
+            uint goff_end = min(t_end, g_end) - g_start;
+            uint n_here = goff_end - goff_start;
+            
+            uint gbase = row * params.row_stride + g * group_bytes;
+            
+            // Read scale (first 2 bytes of group, little-endian)
+            float sc = half_to_float(byte_at(gbase) | (byte_at(gbase + 1u) << 8u));
+            
+            // Unpack nibbles and accumulate
+            uint qbase = gbase + 2u + goff_start / 2u;
+            uint j = goff_start;
+            while (j < goff_end) {
+                uint byte = byte_at(qbase);
+                uint nib = ((j & 1u) == 0u) ? (byte & 0x0Fu) : (byte >> 4u);
+                float w_val = float(int(nib) - 8) * sc;
+                
+                uint k_idx = g * params.group_size + j;
+                float x_val = x[k_idx];
+                acc += w_val * x_val;
+                
+                j += 1u;
+                if ((j & 1u) == 0u) qbase += 1u;
+            }
+        }
+    }
+    
+    y[global_idx] = acc;
+}

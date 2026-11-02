@@ -1,0 +1,44 @@
+{
+  "seq_len": 12,
+  "results": [
+    {
+      "gpu_layers": 0,
+      "ms": null,
+      "error": "FAILED: w natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.\n\nLoading weights:   0%|          | 0/399 [00:00<?, ?it/s]\nLoading weights:  29%|\u2588\u2588\u2589       | 115/399 [00:00<00:00, 1123.35it/s]\nLoading weights:  63%|\u2588\u2588\u2588\u2588\u2588\u2588\u258e   | 250/399 [00:00<00:00, 1249.77it/s]\nLoading weights:  94%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258d| 376/399 [00:00<00:00, 1227.69it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 399/399 [00:00<00:00, 1241.92it/s]"
+    },
+    {
+      "gpu_layers": 1,
+      "ms": null,
+      "error": "FAILED: 0/399 [00:00<?, ?it/s]\nLoading weights:  96%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258c| 382/399 [00:00<00:00, 3759.71it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 399/399 [00:00<00:00, 3765.94it/s]\n[tvk] pipeline 'rmsnorm' declared bindings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3"
+    },
+    {
+      "gpu_layers": 2,
+      "ms": null,
+      "error": "FAILED: :00<00:00, 1569.48it/s]\nLoading weights:  79%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2589  | 316/399 [00:00<00:00, 1537.25it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 399/399 [00:00<00:00, 1555.25it/s]\n[tvk] pipeline 'rmsnorm' declared bindings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3"
+    },
+    {
+      "gpu_layers": 3,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    },
+    {
+      "gpu_layers": 4,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    },
+    {
+      "gpu_layers": 5,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    },
+    {
+      "gpu_layers": 6,
+      "ms": null,
+      "error": "INSUFFICIENT_MEMORY",
+      "status": "SKIPPED"
+    }
+  ]
+}

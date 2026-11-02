@@ -15,7 +15,55 @@ Backend& Backend::instance() {
 
 bool Backend::init(uint32_t device_index) {
   std::lock_guard<std::recursive_mutex> lk(mutex_);
-  if (ready_) return true;
+  if (ready_) {
+    // Check if the device is still valid by attempting a trivial operation.
+    // If the device was lost (e.g., GPU reset), we need to reinitialize.
+    VkCommandBuffer test_cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = cmd_pool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkResult test_result = vkAllocateCommandBuffers(device_, &ai, &test_cmd);
+    if (test_result == VK_ERROR_DEVICE_LOST || test_result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+      std::cerr << "[tvk] Device lost, reinitializing..." << std::endl;
+      ready_ = false;
+    } else if (test_result == VK_SUCCESS) {
+      vkFreeCommandBuffers(device_, cmd_pool_, 1, &test_cmd);
+      return true;
+    }
+    // For other errors, fall through to reinitialize
+  }
+
+  // Cleanup any existing Vulkan resources before reinitializing
+  if (instance_ != VK_NULL_HANDLE) {
+    // Destroy device first (destroys command pool, buffers, etc.)
+    if (device_ != VK_NULL_HANDLE) {
+      vkDeviceWaitIdle(device_);
+      vkDestroyDevice(device_, nullptr);
+      device_ = VK_NULL_HANDLE;
+    }
+    if (cmd_pool_ != VK_NULL_HANDLE) {
+      vkDestroyCommandPool(device_, cmd_pool_, nullptr);
+      cmd_pool_ = VK_NULL_HANDLE;
+    }
+    if (instance_ != VK_NULL_HANDLE) {
+      vkDestroyInstance(instance_, nullptr);
+      instance_ = VK_NULL_HANDLE;
+    }
+    cmd_pool_ = VK_NULL_HANDLE;
+    device_ = VK_NULL_HANDLE;
+    phys_ = VK_NULL_HANDLE;
+    instance_ = VK_NULL_HANDLE;
+    ready_ = false;
+    cmd_pool_ = VK_NULL_HANDLE;
+    device_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
+    phys_ = VK_NULL_HANDLE;
+    cmd_ = VK_NULL_HANDLE;
+    cmd_inflight_ = false;
+    ready_ = false;
+  }
 
   VkApplicationInfo app{};
   app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -47,7 +95,7 @@ bool Backend::init(uint32_t device_index) {
   device_name_ = props.deviceName;
   std::cout << "[tvk] physical device " << device_index << ": " << device_name_
             << " (Vulkan " << VK_VERSION_MAJOR(props.apiVersion) << "."
-            << VK_VERSION_MINOR(props.apiVersion) << ")\n";
+            << VK_VERSION_MINOR(props.apiVersion) << ".)\n";
 
   uint32_t qcount = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(phys_, &qcount, nullptr);
@@ -366,7 +414,6 @@ void Backend::dispatch(const std::string& shader,
 
   // For async dispatches, allocate a new command buffer to avoid reusing
   // the command buffer while the GPU is still executing the previous dispatch.
-  VkCommandBuffer cmd = cmd_;
   bool new_cmd = false;
   if (!sync) {
     VkCommandBufferAllocateInfo ai{};
@@ -374,17 +421,25 @@ void Backend::dispatch(const std::string& shader,
     ai.commandPool = cmd_pool_;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) {
+    if (vkAllocateCommandBuffers(device_, &ai, &cmd_) != VK_SUCCESS) {
       throw std::runtime_error("[tvk] vkAllocateCommandBuffers failed");
     }
+    std::cerr << "[tvk] Allocated new async command buffer: " << cmd_ << std::endl;
     new_cmd = true;
   } else {
     ensure_cmd();
   }
 
+  VkCommandBuffer cmd = cmd_;
+
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  vkBeginCommandBuffer(cmd, &bi);
+  VkResult begin_result = vkBeginCommandBuffer(cmd, &bi);
+  if (begin_result != VK_SUCCESS) {
+    std::string err = "[tvk] vkBeginCommandBuffer failed: " + std::to_string(begin_result);
+    std::cerr << err << std::endl;
+    throw std::runtime_error(err);
+  }
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p->layout, 0, 1,
                           &bnd.set, 0, nullptr);
@@ -419,12 +474,23 @@ void Backend::dispatch(const std::string& shader,
     vkQueueWaitIdle(queue_);
     if (new_cmd) {
       vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd);
+      cmd_ = VK_NULL_HANDLE;
     } else {
-      // For sync dispatches, DON'T reset the command buffer or free descriptor sets.
-      // Keep them for reuse in the next dispatch with the same shader and bindings.
-      // Only mark that no command is in flight.
-      cmd_inflight_ = false;
-    }
+          // For sync dispatches, reset the command buffer so it can be reused.
+          // The command buffer must be reset after vkQueueWaitIdle before it can be reused.
+          VkResult reset_result = vkResetCommandBuffer(cmd_, 0);
+          if (reset_result != VK_SUCCESS) {
+            std::string err = "[tvk] vkResetCommandBuffer failed: " + std::to_string(reset_result);
+            std::cerr << err << std::endl;
+            throw std::runtime_error(err);
+          }
+          std::cerr << "[tvk] Reset command buffer: " << cmd_ << std::endl;
+          // Keep cmd_ valid after reset - it's now ready for reuse.
+          // For sync dispatches, DON'T free descriptor sets.
+          // Keep them for reuse in the next dispatch with the same shader and bindings.
+          // Only mark that no command is in flight.
+          cmd_inflight_ = false;
+        }
   } else {
     cmd_inflight_ = true;
   }
@@ -436,7 +502,14 @@ void Backend::submit() {
   if (device_ == VK_NULL_HANDLE) return;
   if (cmd_inflight_) {
     vkQueueWaitIdle(queue_);
-    vkResetCommandBuffer(cmd_, 0);
+    VkResult reset_result = vkResetCommandBuffer(cmd_, 0);
+    if (reset_result != VK_SUCCESS) {
+      std::string err = "[tvk] vkResetCommandBuffer failed: " + std::to_string(reset_result);
+      std::cerr << err << std::endl;
+      throw std::runtime_error(err);
+    }
+    std::cerr << "[tvk] Reset command buffer in submit: " << cmd_ << std::endl;
+    // Keep cmd_ valid after reset - it's now ready for reuse.
     cmd_inflight_ = false;
   }
   // NOTE: We DON'T free descriptor sets here - they are cached per shader for reuse.
@@ -447,6 +520,9 @@ void Backend::submit() {
     }
     if (sub.new_cmd && sub.cmd != VK_NULL_HANDLE) {
       vkFreeCommandBuffers(device_, cmd_pool_, 1, &sub.cmd);
+      if (sub.cmd == cmd_) {
+        cmd_ = VK_NULL_HANDLE;
+      }
     }
   }
   pending_submissions_.clear();
@@ -518,13 +594,27 @@ std::vector<uint32_t> Backend::load_shader_unlocked(const std::string& name) {
 }
 
 void Backend::ensure_cmd() {
-  if (cmd_ != VK_NULL_HANDLE) return;
+  // If a command buffer is in-flight (async dispatch submitted but not yet submitted),
+  // we must allocate a new one to avoid using a buffer that's still in-flight.
+  if (cmd_ != VK_NULL_HANDLE && !cmd_inflight_) {
+    std::cerr << "[tvk] Reusing command buffer: " << cmd_ << std::endl;
+    return;
+  }
+  if (cmd_ != VK_NULL_HANDLE) {
+    std::cerr << "[tvk] Command buffer in-flight, allocating new one: " << cmd_ << std::endl;
+  }
   VkCommandBufferAllocateInfo ai{};
   ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   ai.commandPool = cmd_pool_;
   ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   ai.commandBufferCount = 1;
-  vkAllocateCommandBuffers(device_, &ai, &cmd_);
+  VkResult alloc_result = vkAllocateCommandBuffers(device_, &ai, &cmd_);
+  if (alloc_result != VK_SUCCESS) {
+    std::string err = "[tvk] vkAllocateCommandBuffers failed: " + std::to_string(alloc_result);
+    std::cerr << err << std::endl;
+    throw std::runtime_error(err);
+  }
+  std::cerr << "[tvk] Allocated new command buffer: " << cmd_ << std::endl;
 }
 
 Backend::~Backend() {

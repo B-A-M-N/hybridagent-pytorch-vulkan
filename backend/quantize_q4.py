@@ -39,12 +39,14 @@ def quantize_row(row: np.ndarray, group_size: int = GROUP_SIZE) -> bytes:
     for g in range(0, K, group_size):
         blk = row[g:g + group_size]
         amax = float(np.abs(blk).max())
-        scale = amax / 7.0 if amax > 0 else 1.0
+        scale_fp32 = amax / 7.0 if amax > 0 else 1.0
+        # Store scale as fp16, then use fp16 value for quantization
+        scale16 = np.float16(scale_fp32)
+        scale = float(scale16)
         q = np.clip(np.round(blk / scale), -8, 7).astype(np.int8) + 8
         q = q.astype(np.uint8)
         # fp16 scale, little-endian
-        scale16 = float(np.float16(scale))
-        out += np.float16(scale16).tobytes()
+        out += scale16.tobytes()
         # pack nibbles: low = even index, high = odd index
         even = q[0::2] & 0x0F
         odd = q[1::2] & 0x0F
@@ -72,7 +74,7 @@ def dequantize_weight(packed: bytes, N: int, K: int,
         for g in range(K // group_size):
             gbase = base + g * group_bytes
             h = packed[gbase] | (packed[gbase + 1] << 8)
-            # fp16 -> fp32
+            # fp16 -> fp32 (matches shader half_to_float)
             sgn = (h >> 15) & 1
             exp = (h >> 10) & 0x1F
             man = h & 0x3FF

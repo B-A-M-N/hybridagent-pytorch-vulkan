@@ -1,0 +1,40 @@
+{
+  "seq_len": 12,
+  "results": [
+    {
+      "gpu_layers": 0,
+      "seconds": null,
+      "error": "d is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.\n\nLoading weights:   0%|          | 0/399 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 399/399 [00:00<00:00, 9608.53it/s]\n"
+    },
+    {
+      "gpu_layers": 1,
+      "seconds": null,
+      "error": "ings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3\n"
+    },
+    {
+      "gpu_layers": 2,
+      "seconds": null,
+      "error": "ings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3\n"
+    },
+    {
+      "gpu_layers": 3,
+      "seconds": null,
+      "error": "ings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3\n"
+    },
+    {
+      "gpu_layers": 4,
+      "seconds": null,
+      "error": "ings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3\n"
+    },
+    {
+      "gpu_layers": 5,
+      "seconds": null,
+      "error": "ings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3\n"
+    },
+    {
+      "gpu_layers": 6,
+      "seconds": null,
+      "error": "ings=3 passed=3\n[tvk] pipeline 'matmul_t_bias' declared bindings=4 passed=4\n[tvk] pipeline 'pack3' declared bindings=4 passed=4\n[tvk] pipeline 'rope_qkv' declared bindings=1 passed=1\n[tvk] pipeline 'attention2' declared bindings=6 passed=6\n[tvk] pipeline 'fused_gate_up' declared bindings=3 passed=3\n"
+    }
+  ]
+}

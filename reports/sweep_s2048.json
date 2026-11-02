@@ -1,0 +1,40 @@
+{
+  "seq_len": 2048,
+  "results": [
+    {
+      "gpu_layers": 0,
+      "seconds": 208.89024826999957,
+      "error": null
+    },
+    {
+      "gpu_layers": 1,
+      "seconds": 190.3837358039964,
+      "error": null
+    },
+    {
+      "gpu_layers": 2,
+      "seconds": 210.47380810399773,
+      "error": null
+    },
+    {
+      "gpu_layers": 3,
+      "seconds": 182.9403298660036,
+      "error": null
+    },
+    {
+      "gpu_layers": 4,
+      "seconds": 208.99929596800212,
+      "error": null
+    },
+    {
+      "gpu_layers": 5,
+      "seconds": 220.44733661699865,
+      "error": null
+    },
+    {
+      "gpu_layers": 6,
+      "seconds": null,
+      "error": "  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/bamn/ai-experiments/hybridagent-pytorch-vulkan/backend/torch_vulkan_ext/torch_vulkan_ext/__init__.py\", line 136, in __init__\n    raise MemoryError(f\"failed to allocate {self._size} bytes ({kind})\")\nMemoryError: failed to allocate 402653184 bytes (device)\n"
+    }
+  ]
+}
