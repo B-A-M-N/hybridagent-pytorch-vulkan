@@ -24,13 +24,17 @@
     "gpu2_warm_ms": 437.9,
     "gpu5_warm_ms": 449.3,
     "gpu10_warm_ms": 804.5,
-    "best": "gpu2"
+    "best": "gpu2",
+    "gpu3_warm_ms": 671.9,
+    "gpu4_warm_ms": 444.1,
+    "note": "2-4 GPU layers plateau ~438-449ms; 3-layer run CPU time inflated (618ms, likely system noise); 10 layers 805ms due Vulkan per-layer cost growth"
   },
   "thread_sweep_gpu2": {
     "threads6_warm_ms": 628.7,
     "threads12_warm_ms": 437.9,
     "threads24_warm_ms": 658.9,
     "best": 12,
-    "note": "6-thread run produced NaN once (intermittent); 12-thread runs consistently finite"
+    "note": "6-thread run produced NaN once (intermittent); 12-thread runs consistently finite",
+    "threads16_warm_ms": 551.3
   }
 }
