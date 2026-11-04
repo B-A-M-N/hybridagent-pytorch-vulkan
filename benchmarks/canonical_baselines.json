@@ -1,8 +1,36 @@
 {
   "date": "2026-11-04",
   "harness": "test_100_latent_full.py (canonical HybridBackbone.forward, HybridLink, INT8 CPU layers via torch._int_mm, random 12-token prefill, 12 CPU threads)",
-  "cpu_only_gpu0_20steps": {"warm_median_ms": 480.6, "cpu_layer_ms": 478.6, "finite": true},
-  "hetero_gpu5_100steps": {"median_ms": 449.1, "warm_median_ms": 449.3, "cpu_layer_ms": 346.8, "vulkan_layer_ms": 105.4, "kv_len_final": 112, "finite": true},
-  "previous_fp32_dequant": {"cpu_only_warm_ms": 9044.4, "hetero5_warm_ms": 6759.8},
-  "notes": "Int8Linear now uses torch._int_mm (per-row activation INT8 quant + int32 GEMV + scales) instead of FP32 dequant per call (87-89% of old time). Per-proj: q 19.5->1.3ms, gate 58->3.0ms, down 60->2.9ms. Activation-quant rel error ~1% vs FP32 dequant. Vulkan layers now ~21ms/layer vs CPU INT8 ~11-13ms/layer; hetero advantage narrowed to 480->449ms."
+  "cpu_only_gpu0_20steps": {
+    "warm_median_ms": 480.6,
+    "cpu_layer_ms": 478.6,
+    "finite": true
+  },
+  "hetero_gpu5_100steps": {
+    "median_ms": 449.1,
+    "warm_median_ms": 449.3,
+    "cpu_layer_ms": 346.8,
+    "vulkan_layer_ms": 105.4,
+    "kv_len_final": 112,
+    "finite": true
+  },
+  "previous_fp32_dequant": {
+    "cpu_only_warm_ms": 9044.4,
+    "hetero5_warm_ms": 6759.8
+  },
+  "notes": "Int8Linear now uses torch._int_mm (per-row activation INT8 quant + int32 GEMV + scales) instead of FP32 dequant per call (87-89% of old time). Per-proj: q 19.5->1.3ms, gate 58->3.0ms, down 60->2.9ms. Activation-quant rel error ~1% vs FP32 dequant. Vulkan layers now ~21ms/layer vs CPU INT8 ~11-13ms/layer; hetero advantage narrowed to 480->449ms.",
+  "placement_sweep_20steps": {
+    "gpu0_warm_ms": 480.6,
+    "gpu2_warm_ms": 437.9,
+    "gpu5_warm_ms": 449.3,
+    "gpu10_warm_ms": 804.5,
+    "best": "gpu2"
+  },
+  "thread_sweep_gpu2": {
+    "threads6_warm_ms": 628.7,
+    "threads12_warm_ms": 437.9,
+    "threads24_warm_ms": 658.9,
+    "best": 12,
+    "note": "6-thread run produced NaN once (intermittent); 12-thread runs consistently finite"
+  }
 }
