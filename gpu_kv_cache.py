@@ -27,6 +27,8 @@ class GPUKVCache:
         # GPU buffers for K/V cache
         self.k_cache = None
         self.v_cache = None
+        self.k_cache_view = None
+        self.v_cache_view = None
         self.valid_len = 0
         self._allocated = False
         
@@ -39,6 +41,8 @@ class GPUKVCache:
         
         self.k_cache = self.device_allocator.Allocation(max(1, k_elements) * 4, "device")
         self.v_cache = self.device_allocator.Allocation(max(1, v_elements) * 4, "device")
+        self.k_cache_view = self.k_cache.view()
+        self.v_cache_view = self.v_cache.view()
         self._allocated = True
         print(f"[GPUKVCache] Layer {self.layer_idx}: Allocated K/V cache for cap={cap} (K:{k_elements}, V:{v_elements} elements)")
         
@@ -79,6 +83,8 @@ class GPUKVCache:
             
         self.k_cache = new_k_cache
         self.v_cache = new_v_cache
+        self.k_cache_view = self.k_cache.view()
+        self.v_cache_view = self.v_cache.view()
         
     def get_capacity(self):
         if not self._allocated:
@@ -101,23 +107,20 @@ class GPUKVCache:
         if required_cap > self.get_capacity():
             self._grow(required_cap)
             
-        # Write new K/V at valid_len offset
-        # k_new: [S, KVD] -> write to k_cache at [0, 0, valid_len, 0]
-        k_write_offset = self.valid_len * self.num_kv_heads * self.head_dim
-        v_write_offset = self.valid_len * self.num_kv_heads * self.head_dim
-        
-        # Download k_new/v_new to CPU for staging (simplified - ideally use GPU->GPU copy)
-        k_cpu = k_new.cpu()
-        v_cpu = v_new.cpu()
-        
-        # Create staging buffers and upload
-        k_stage = _Buf(k_cpu)
-        v_stage = _Buf(v_cpu)
-        
-        # We need a slice that writes at the correct offset
-        # This is a simplified approach - in production use a proper append kernel
+        # Write via the dedicated kv_append kernel (slice's push offset is a
+        # SOURCE offset with dst fixed at 0, so it cannot append at a dst
+        # offset; the previous slice-based append corrupted the cache).
+        # Pack [K | V] on CPU (4 KB per tensor at decode) and use kv_append
+        # with q_len=0, pos=valid_len.
+        # kv_append writes one slot per dispatch; loop for S>1 (prefill seed).
+        k_cpu = k_new.cpu().reshape(S, KVD)
+        v_cpu = v_new.cpu().reshape(S, KVD)
+        for s in range(S):
+            kv_packed = _Buf(torch.cat([k_cpu[s], v_cpu[s]]))
+            tvk.kv_append(kv_packed.buf, self.k_cache_view, self.v_cache_view,
+                          self.valid_len + s, self.get_capacity(), self.head_dim,
+                          KVD, q_len=0)
         tvk.submit()
-        
         self.valid_len += S
         
     def get_kv_views(self, cap: int):
@@ -128,12 +131,10 @@ class GPUKVCache:
         if not self._allocated or self.valid_len == 0:
             return None, None
             
-        actual_cap = min(cap, self.valid_len)
-        elements = 1 * self.num_kv_heads * actual_cap * self.head_dim
-        
-        k_view = _Buf._wrap(self.k_cache.view(0, elements * 4), elements)
-        v_view = _Buf._wrap(self.v_cache.view(0, elements * 4), elements)
-        
+        # Return full-allocation views; caller bounds reads with cap
+        # (attention2 receives cap). Sub-view creation is unreliable.
+        k_view = _Buf._wrap(self.k_cache_view, self.k_cache_view.size)
+        v_view = _Buf._wrap(self.v_cache_view, self.v_cache_view.size)
         return k_view, v_view
         
     def to_cpu(self, cap: int):
@@ -145,12 +146,9 @@ class GPUKVCache:
             return None, None
             
         actual_cap = min(cap, self.valid_len)
-        elements = 1 * self.num_kv_heads * actual_cap * self.head_dim
-        
-        k_cpu = self.k_cache.view(0, elements * 4).download((1, self.num_kv_heads, actual_cap, self.head_dim))
-        v_cpu = self.v_cache.view(0, elements * 4).download((1, self.num_kv_heads, actual_cap, self.head_dim))
-        
-        return k_cpu, v_cpu
+        k_cpu = self.k_cache_view.download((1, self.num_kv_heads, self.get_capacity(), self.head_dim))
+        v_cpu = self.v_cache_view.download((1, self.num_kv_heads, self.get_capacity(), self.head_dim))
+        return k_cpu[:, :, :actual_cap, :], v_cpu[:, :, :actual_cap, :]
         
     def reset(self):
         """Reset the cache to empty state."""

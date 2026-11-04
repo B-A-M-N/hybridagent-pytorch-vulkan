@@ -569,7 +569,7 @@ class VulkanDecoderLayer(torch.nn.Module):
         # Initialize GPU KV cache manager on first forward (only if not disabled)
         if os.environ.get("DISABLE_GPU_KV") != "1":
             if self._gpu_kv_manager is None:
-                from p2_gpu_kv_test import GPUKVCacheManager
+                from gpu_kv_cache import GPUKVCacheManager
                 self._gpu_kv_manager = GPUKVCacheManager(self.config, {self.layer_idx})
             if self._gpu_kv_cache is None:
                 self._gpu_kv_cache = self._gpu_kv_manager.get_cache(self.layer_idx)
@@ -585,6 +585,16 @@ class VulkanDecoderLayer(torch.nn.Module):
         kv_cache = self._gpu_kv_cache
         
         if kv_cache is not None and kv_cache._allocated and kv_cache.valid_len > 0:
+            # Append current K/V BEFORE attention so the query can attend to
+            # itself (previously the current token was excluded for one step).
+            kv_cache.append_kv(_Buf(k), _Buf(v), S, KVD)
+            # Keep DynamicCache entry in lock-step (current token only;
+            # prefill history is already in DynamicCache).
+            if past_key_values is not None and hasattr(past_key_values, 'update'):
+                past_key_values.update(
+                    k.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                    v.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                    self.layer_idx)
             # Use existing GPU-resident K/V for attention
             cap = kv_cache.valid_len
             k_view, v_view = kv_cache.get_kv_views(cap)
@@ -620,9 +630,6 @@ class VulkanDecoderLayer(torch.nn.Module):
                 tvk.submit()
                 attn = ob.download((self.num_heads, n_q, self.head_dim))
                 attn = attn.permute(1, 0, 2).reshape(n_q, HD)
-                
-                # ---- Append new K/V to GPU cache for next step
-                kv_cache.append_kv(_Buf(k), _Buf(v), S, KVD)
             else:
                 # Fallback to CPU path
                 fallback_to_cpu = True
@@ -673,6 +680,12 @@ class VulkanDecoderLayer(torch.nn.Module):
                     tvk.submit()
                     attn = ob.download((self.num_heads, n_q, self.head_dim))
                     attn = attn.permute(1, 0, 2).reshape(n_q, HD)
+                    # DynamicCache holds prefill history; add current only.
+                    if past_key_values is not None and hasattr(past_key_values, 'update'):
+                        past_key_values.update(
+                            k.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                            v.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                            self.layer_idx)
                 else:
                     fallback_to_cpu = True
             else:
@@ -758,6 +771,8 @@ class VulkanDecoderLayer(torch.nn.Module):
         else:
             mlp = self._lin(gu_t, self._w["down"], self._zero_h, self.hidden_size)
         h = residual + mlp.to(layer_dtype)
+        if os.environ.get("VK_LAYER_DEBUG"):
+            print(f"DEBUG vk layer {self.layer_idx} finite={bool(torch.isfinite(h.float()).all())} absmax={float(h.float().abs().max()) if bool(torch.isfinite(h.float()).any()) else 'nan'} attnfinite={bool(torch.isfinite(attn).all())}", flush=True)
 
         if stats is not None:
             stats.vk_time_s += time.time() - t0

@@ -80,13 +80,13 @@ class Int8Linear(nn.Module):
         
         # For now, fall back to the previous implementation but optimize
         # by reusing the scaled weight tensor
-        if not hasattr(self, '_weight_fp_cached') or self._weight_fp_cached.shape != self.weight_int8.shape:
-            w_fp = self.weight_int8.to(torch.float32)
-            self._weight_fp_cached = w_fp * self.scales.unsqueeze(1)  # [out, in] float32
-        
-        # Now do matmul with bfloat16
+        # NOTE: do NOT cache the dequantized fp32 weight on the module.
+        # Caching materializes a full fp32 copy per layer (~32 GB across
+        # 36 layers for an 8B model) and destroys performance via swap.
+        # Materialize per-call and let it be freed after the matmul.
+        w_fp = self.weight_int8.to(torch.float32) * self.scales.unsqueeze(1)
         x_fp = x.to(torch.float32)  # [..., in]
-        out = x_fp @ self._weight_fp_cached.t()  # [..., out] float32
+        out = x_fp @ w_fp.t()  # [..., out] float32
         
         if self.bias is not None:
             out = out + self.bias.to(torch.float32)

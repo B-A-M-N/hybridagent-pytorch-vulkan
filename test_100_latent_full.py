@@ -156,7 +156,19 @@ with safe_open(SAFETENSORS_PATH, framework="pt", device="cpu") as f:
 
 backbone.load_state_dict(state_dict, assign=True)
 backbone = backbone.to_empty(device="cpu")
-
+# load_state_dict(assign=True) only assigns nn.Parameters; buffers created
+# on the meta device stay meta and to_empty() materializes them as
+# uninitialized (NaN) memory. Copy every state_dict entry into buffers
+# (and params, for safety) explicitly.
+_param_map = dict(backbone.named_parameters())
+_buffer_map = dict(backbone.named_buffers())
+for _name, _tensor in state_dict.items():
+    if _name in _param_map:
+        _param_map[_name].data.copy_(_tensor.to(_param_map[_name].dtype))
+    elif _name in _buffer_map:
+        _buffer_map[_name].data.copy_(_tensor.to(_buffer_map[_name].dtype))
+    # else: lm_head / embed handled as params; unknown keys ignored here
+    # (load_state_dict already validated strictness)
 # Load Vulkan layer weights
 if gpu_layer_indices:
     with safe_open(ORIGINAL_SAFETENSORS_PATH, framework="pt", device="cpu") as f:
