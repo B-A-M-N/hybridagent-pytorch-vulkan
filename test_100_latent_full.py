@@ -274,13 +274,13 @@ if os.environ.get("HYBRID_KEEP_CPU_WEIGHTS") != "1":
 else:
     print(f"  RSS after upload (weights retained): {_rss_mb():.0f} MB")
 
-# Attach GPU KV cache manager to Vulkan layers (same as p2_gpu_kv_test.py)
+# Attach GPU KV cache manager to Vulkan layers (single owner: gpu_kv_cache)
 if gpu_layers > 0:
-    from p2_gpu_kv_test import GPUKVCacheManager, _Buf
+    from gpu_kv_cache import GPUKVCacheManager, _Buf
     kv_manager = GPUKVCacheManager(config, set(range(gpu_layers)))
     for layer in hb.layers:
         if isinstance(layer, VulkanDecoderLayer):
-            layer._gpu_kv_cache = kv_manager
+            layer._gpu_kv_manager = kv_manager
 
 # Now test 100 latent steps with full model
 print("\n--- Testing 100 sequential latent steps ---")
@@ -296,8 +296,8 @@ with torch.no_grad():
     # Seed GPU KV cache with prefill data from DynamicCache
     if gpu_layers > 0:
         for layer in hb.layers:
-            if isinstance(layer, VulkanDecoderLayer) and hasattr(layer, '_gpu_kv_cache'):
-                kv_mgr = layer._gpu_kv_cache
+            if isinstance(layer, VulkanDecoderLayer) and hasattr(layer, '_gpu_kv_manager'):
+                kv_mgr = layer._gpu_kv_manager
                 cached_layer = past_kv.layers[layer.layer_idx]
                 # Get K/V from DynamicCache: [1, n_kv_heads, seq_len, head_dim]
                 cached_k = cached_layer.keys  # [1, n_kv_heads, seq_len, head_dim]
