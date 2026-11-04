@@ -1,5 +1,10 @@
 # HybridAgent — Heterogeneous PyTorch CPU INT8 / Vulkan Execution
 
+> **Experimental, reproducible research implementation.** This is an
+> initial technical release of a working heterogeneous inference
+> implementation — not a universally optimized production runtime.
+> Performance numbers are for the exact tested hardware below only.
+
 A PyTorch implementation of HybridAgent that keeps the original
 `HybridGenerationEngine` and `HybridLink` unchanged, and changes only
 *where* the Qwen3 backbone's transformer layers execute: INT8-quantized
@@ -57,8 +62,8 @@ This repository's Vulkan backend, heterogeneous backbone, GPU KV cache,
 and INT8 CPU path are the additions.
 
 ## Release status
-Clean-checkout install is currently BLOCKED: `third_party/` (HybridAgent,
-torch-vulkan) is not tracked in git and `scripts/install.sh` does not
-fetch it — see `RELEASE_QUALIFICATION.md` (P4). Building from this
-working tree (with vendored `third_party/` present) works and is what
-all benchmarks above were measured on.
+**QUALIFIED WITH LIMITATIONS** at commit `ad45409` — clean-checkout
+build verified (vendored `third_party/`, `scripts/install.sh` EXIT 0,
+deterministic `tvkvk.so`). See `RELEASE_QUALIFICATION.md` for the full
+gate report and limitations, and `BENCHMARKS.md` for measured numbers.
+Published as an experimental implementation, not a production runtime.

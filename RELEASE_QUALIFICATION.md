@@ -1,6 +1,6 @@
 # Release Qualification
 
-Candidate: dcc5663 (+ ee1ead3 GPU-KV fix, 7c2998c _int_mm optimization)
+Candidate (final, frozen): ad45409 (dcc5663 baseline + ee1ead3, 7c2998c, 5261d2f, 838218d, ad45409)
 Date: 2026-11-04. Hardware: Ryzen 9 5900X, RX 6600 XT 8GB, RADV Vulkan 1.4.
 
 ## Gates
@@ -34,4 +34,4 @@ but not performance-leading; (2) legacy Kompute/torch-vulkan build
 skipped (lost vk_ops.cpp/tvk_registry.cpp sources; unused by canonical
 path); (3) Q4 disabled/unqualified; (4) _int_mm ~1% approx error;
 (5) harness RAM 18-20GB; (6) dmesg/GPU-temp not instrumented.
-Final candidate: 838218d (+ doc updates). No push/publish performed.
+Final candidate: ad45409 (frozen). No push/publish performed.

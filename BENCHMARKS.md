@@ -4,8 +4,8 @@
 - CPU: AMD Ryzen 9 5900X (Zen 3), 12 threads pinned (`HYBRID_CPU_THREADS=12`, `OMP_NUM_THREADS=12`)
 - GPU: AMD RX 6600 XT 8 GB, RADV Vulkan 1.4
 - Python 3.11, PyTorch 2.12.0+cpu, transformers 5.13.0
-- Candidate commit: 838218d (dcc5663 + ee1ead3 GPU-KV fix, 7c2998c _int_mm, 5261d2f vendored third_party, 838218d install.sh fix)
-- Clean-checkout tvkvk.so sha256: see git — built fresh in /tmp worktree verification
+- Candidate commit: ad45409 (dcc5663 baseline + ee1ead3 GPU-KV fix, 7c2998c _int_mm, 5261d2f vendored third_party, 838218d install.sh fix, ad45409 docs)
+- Clean-checkout tvkvk.so sha256: 18d76e55adf449f160f7091f29199600c0ab5631b8d750ecd7c77aaa8b1c0aab (identical in main tree and fresh worktree build)
 
 ## Checkpoints (SHA256)
 - INT8 (CPU): weights/HybridAgent-8B-Agentic-INT8/model.safetensors `77e44ad29948998b09f702786129a04c585c55944b58ae909f3316dc0faccf08`
