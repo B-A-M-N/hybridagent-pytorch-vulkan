@@ -1,0 +1,63 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufIn { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufWeight { float weight[]; };
+layout(set = 0, binding = 2) buffer BufBias { float bias[]; };
+layout(set = 0, binding = 3) buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_rows;
+    uint row_size;
+} params;
+
+shared float shared_sum[256];
+shared float shared_sq_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (row >= params.num_rows) return;
+    
+    uint base = row * params.row_size;
+    float eps = 1e-5;
+    
+    // Step 1: compute mean
+    float local_sum = 0.0;
+    for (uint i = tid; i < params.row_size; i += 256) {
+        local_sum += in_data[base + i];
+    }
+    shared_sum[tid] = local_sum;
+    barrier();
+    
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) shared_sum[tid] += shared_sum[tid + s];
+        barrier();
+    }
+    float mean = shared_sum[0] / float(params.row_size);
+    barrier();
+    
+    // Step 2: compute variance
+    float local_sq = 0.0;
+    for (uint i = tid; i < params.row_size; i += 256) {
+        float diff = in_data[base + i] - mean;
+        local_sq += diff * diff;
+    }
+    shared_sq_sum[tid] = local_sq;
+    barrier();
+    
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) shared_sq_sum[tid] += shared_sq_sum[tid + s];
+        barrier();
+    }
+    float variance = shared_sq_sum[0] / float(params.row_size);
+    float inv_std = inversesqrt(variance + eps);
+    barrier();
+    
+    // Step 3: normalize, scale, shift
+    for (uint i = tid; i < params.row_size; i += 256) {
+        float normalized = (in_data[base + i] - mean) * inv_std;
+        out_data[base + i] = normalized * weight[i] + bias[i];
+    }
+}

@@ -1,0 +1,84 @@
+#version 450
+// Fused RMS norm + Q6_K matmul. See fused_norm_matmul_q4k.comp for design notes.
+// Bindings: 0=raw_input[K], 1=norm_weights[K], 2=q6k_weights, 3=output[N]
+
+#define BLOCK_ELEMS 256
+#define Q6K_BLOCK_BYTES 210
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufIn     { float raw_in[]; };
+layout(set = 0, binding = 1) buffer BufNorm   { float norm_w[]; };
+layout(set = 0, binding = 2) buffer BufWeight { uint b_data[]; };
+layout(set = 0, binding = 3) buffer BufOut    { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; } params;
+
+shared float sdata[WG_SIZE];
+
+uint read_byte(uint off) { return (b_data[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu; }
+float fp16(uint off) { return unpackHalf2x16(read_byte(off) | (read_byte(off+1u)<<8u)).x; }
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Step 1: RMS norm reduction
+    float sum_sq = 0.0;
+    for (uint i = tid; i < params.K; i += WG_SIZE) {
+        float v = raw_in[i];
+        sum_sq += v * v;
+    }
+    sdata[tid] = sum_sq;
+    barrier();
+    for (uint s = WG_SIZE/2u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(params.K) + 1e-5);
+
+    // Step 2: Q6_K matmul with on-the-fly norm
+    uint blocks_per_row = params.K / BLOCK_ELEMS;
+    uint row_off = n * blocks_per_row * Q6K_BLOCK_BYTES;
+    float partial = 0.0;
+
+    for (uint k = tid; k < params.K; k += WG_SIZE) {
+        float a_val = norm_w[k] * raw_in[k] * inv_rms;
+
+        uint blk = k / BLOCK_ELEMS;
+        uint pos = k % BLOCK_ELEMS;
+        uint boff = row_off + blk * Q6K_BLOCK_BYTES;
+
+        float d = fp16(boff + 208u);
+
+        uint g = pos / 128u;
+        uint pos_in_group = pos % 128u;
+        uint quad = pos_in_group / 32u;
+        uint l = pos_in_group % 32u;
+
+        uint ql_idx = g * 64u + l + ((quad & 1u) * 32u);
+        uint ql_byte = read_byte(boff + ql_idx);
+        uint ql_val = (quad < 2u) ? (ql_byte & 0x0Fu) : ((ql_byte >> 4u) & 0x0Fu);
+
+        uint qh_byte = read_byte(boff + 128u + g * 32u + l);
+        uint qh_val = (qh_byte >> (quad * 2u)) & 0x03u;
+
+        uint sc_idx = g * 8u + quad * 2u + l / 16u;
+        int sc_raw = int(read_byte(boff + 192u + sc_idx));
+        float sc = d * float(sc_raw - ((sc_raw >= 128) ? 256 : 0));
+
+        int q = int(ql_val | (qh_val << 4u)) - 32;
+        float w = float(q) * sc;
+        partial += a_val * w;
+    }
+
+    sdata[tid] = partial;
+    barrier();
+    for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    if (tid == 0u) c[n] = sdata[0];
+}

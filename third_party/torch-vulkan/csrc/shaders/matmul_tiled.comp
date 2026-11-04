@@ -1,0 +1,61 @@
+#version 450
+
+#define TILE_SIZE 16
+
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} params;
+
+shared float tileA[TILE_SIZE][TILE_SIZE];
+shared float tileB[TILE_SIZE][TILE_SIZE];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint localRow = gl_LocalInvocationID.y;
+    uint localCol = gl_LocalInvocationID.x;
+
+    float sum = 0.0;
+    uint numTiles = (params.K + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        // Load tile of A into shared memory
+        uint aCol = t * TILE_SIZE + localCol;
+        if (row < params.M && aCol < params.K) {
+            tileA[localRow][localCol] = a[row * params.K + aCol];
+        } else {
+            tileA[localRow][localCol] = 0.0;
+        }
+
+        // Load tile of B into shared memory
+        uint bRow = t * TILE_SIZE + localRow;
+        if (bRow < params.K && col < params.N) {
+            tileB[localRow][localCol] = b[bRow * params.N + col];
+        } else {
+            tileB[localRow][localCol] = 0.0;
+        }
+
+        // Sync to make sure tiles are loaded
+        barrier();
+
+        // Accumulate dot product for this tile
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += tileA[localRow][k] * tileB[k][localCol];
+        }
+
+        // Sync before loading next tile
+        barrier();
+    }
+
+    if (row < params.M && col < params.N) {
+        c[row * params.N + col] = sum;
+    }
+}

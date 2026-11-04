@@ -1,0 +1,153 @@
+#version 450
+// Fused KV-store + GQA attention with f16 KV cache.
+// Workgroup 0 stores the current token's K/V into the cache before scoring.
+// All workgroups then compute attention scores, softmax, and weighted V sum.
+//
+// This eliminates one dispatch + one barrier per layer vs separate kv_store + attention.
+//
+// Bindings: 0=qkv(f32), 1=k_cache(f16 packed), 2=v_cache(f16 packed),
+//           3=rope_factors, 4=output(f32)
+// Push: pos, seq_len, n_heads, n_kv_heads, heads_per_kv, q_len, kv_len, rope_dim
+// Dispatch: [N_HEADS, 1, 1] workgroups of 128 (HEAD_DIM).
+
+#define HEAD_DIM 128
+#define MAX_SEQ 2048
+
+layout(local_size_x = HEAD_DIM) in;
+
+layout(set = 0, binding = 0) buffer BufQKV     { float qkv[]; };
+layout(set = 0, binding = 1) buffer BufK       { uint k_packed[]; };
+layout(set = 0, binding = 2) buffer BufV       { uint v_packed[]; };
+layout(set = 0, binding = 3) buffer BufFactors { float factors[]; };
+layout(set = 0, binding = 4) buffer BufOut     { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint pos;
+    uint seq_len;     // = pos + 1
+    uint n_heads;
+    uint n_kv_heads;
+    uint heads_per_kv;
+    uint q_len;       // n_heads * head_dim
+    uint kv_len;      // n_kv_heads * head_dim
+    uint rope_dim;
+} params;
+
+const float ROPE_THETA = 10000.0;
+const float ATTN_FACTOR = 1.190238;
+
+shared float s_reduce[HEAD_DIM];
+shared float s_scores[MAX_SEQ];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;  // 0..127
+
+    // === Phase 0: RoPE on Q and K (all workgroups cooperate) ===
+    // Each workgroup handles a subset of the (head, pair) combinations.
+    // Total rope work: (n_heads + n_kv_heads) * rope_dim/2 = 32 * 48 = 1536 pairs
+    // With 24 workgroups × 128 threads = 3072 threads, each thread handles ~0.5 pairs
+    {
+        uint total_rope_heads = params.n_heads + params.n_kv_heads;
+        uint pairs_per_head = params.rope_dim / 2u;
+        uint total_pairs = total_rope_heads * pairs_per_head;
+        uint global_tid = h * HEAD_DIM + d;
+
+        if (global_tid < total_pairs) {
+            uint rh = global_tid / pairs_per_head;
+            uint ri = global_tid % pairs_per_head;
+
+            uint base;
+            if (rh < params.n_heads) {
+                base = rh * HEAD_DIM;
+            } else {
+                base = params.q_len + (rh - params.n_heads) * HEAD_DIM;
+            }
+
+            float base_freq = 1.0 / pow(ROPE_THETA, 2.0 * float(ri) / float(params.rope_dim));
+            float factor = (ri < factors.length()) ? factors[ri] : 1.0;
+            float freq = base_freq / factor;
+            float angle = float(params.pos) * freq;
+            float cos_t = cos(angle) * ATTN_FACTOR;
+            float sin_t = sin(angle) * ATTN_FACTOR;
+
+            float x0 = qkv[base + 2u * ri];
+            float x1 = qkv[base + 2u * ri + 1u];
+            qkv[base + 2u * ri]      = x0 * cos_t - x1 * sin_t;
+            qkv[base + 2u * ri + 1u] = x0 * sin_t + x1 * cos_t;
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    // === Phase 1: KV store — pack K/V into f16 cache ===
+    // Thread d handles 2 elements: d*2 and d*2+1 (if d < kv_len/2 and d < 128)
+    // kv_len = 1024, so kv_len/2 = 512. With 128 threads, need all WGs to cooperate.
+    // But cross-WG sync is impossible. Alternative: workgroup 0 does all 512 pairs,
+    // using 128 threads × 4 iterations.
+    if (h == 0u) {
+        uint half_kv = params.kv_len / 2u;
+        uint cache_base = params.pos * params.kv_len;
+        for (uint p = d; p < half_kv; p += HEAD_DIM) {
+            uint e0 = p * 2u;
+            uint e1 = e0 + 1u;
+            float k0 = qkv[params.q_len + e0];
+            float k1 = qkv[params.q_len + e1];
+            k_packed[(cache_base + e0) / 2u] = packHalf2x16(vec2(k0, k1));
+
+            float v0 = qkv[params.q_len + params.kv_len + e0];
+            float v1 = qkv[params.q_len + params.kv_len + e1];
+            v_packed[(cache_base + e0) / 2u] = packHalf2x16(vec2(v0, v1));
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    // === Phase 2: Q·K scores ===
+    uint kv_h = h / params.heads_per_kv;
+    uint kv_stride = params.n_kv_heads * HEAD_DIM;
+    float scale = 1.0 / sqrt(float(HEAD_DIM));
+    float q_val = qkv[h * HEAD_DIM + d];
+
+    for (uint j = 0; j < params.seq_len; j++) {
+        uint linear = j * kv_stride + kv_h * HEAD_DIM + d;
+        uint word_idx = linear / 2u;
+        vec2 pair = unpackHalf2x16(k_packed[word_idx]);
+        float k_val = ((linear & 1u) == 0u) ? pair.x : pair.y;
+
+        s_reduce[d] = q_val * k_val;
+        barrier();
+        for (uint s = HEAD_DIM / 2; s > 0; s >>= 1) {
+            if (d < s) s_reduce[d] += s_reduce[d + s];
+            barrier();
+        }
+        if (d == 0) s_scores[j] = s_reduce[0] * scale;
+        barrier();
+    }
+
+    // === Phase 3: Softmax ===
+    if (d == 0) {
+        float max_s = -1e30;
+        for (uint j = 0; j < params.seq_len; j++) max_s = max(max_s, s_scores[j]);
+        float sum_exp = 0.0;
+        for (uint j = 0; j < params.seq_len; j++) {
+            s_scores[j] = exp(s_scores[j] - max_s);
+            sum_exp += s_scores[j];
+        }
+        if (sum_exp > 0.0) {
+            float inv = 1.0 / sum_exp;
+            for (uint j = 0; j < params.seq_len; j++) s_scores[j] *= inv;
+        }
+    }
+    barrier();
+
+    // === Phase 4: Weighted V sum ===
+    float acc = 0.0;
+    for (uint j = 0; j < params.seq_len; j++) {
+        uint linear = j * kv_stride + kv_h * HEAD_DIM + d;
+        uint word_idx = linear / 2u;
+        vec2 pair = unpackHalf2x16(v_packed[word_idx]);
+        float v_val = ((linear & 1u) == 0u) ? pair.x : pair.y;
+        acc += s_scores[j] * v_val;
+    }
+    out_data[h * HEAD_DIM + d] = acc;
+}

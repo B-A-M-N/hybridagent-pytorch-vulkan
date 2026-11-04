@@ -1,0 +1,82 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Batched Q6_K matmul — raw GGUF format, group processing.
+// Dispatch: [N, M, 1]
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; uint M; } params;
+
+uint rb(uint base_u32, uint byte_off) {
+    return (w[base_u32 + (byte_off >> 2u)] >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    if (n >= params.N || m >= params.M) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint total_groups = bpr * 16u;
+    uint row_byte_off = n * bpr * 210u;
+    uint a_off = m * params.K;
+    float partial = 0.0;
+
+    for (uint g = tid; g < total_groups; g += WG_SIZE) {
+        uint blk = g / 16u;
+        uint grp = g % 16u;
+        uint blk_byte = row_byte_off + blk * 210u;
+        uint bo = blk_byte / 4u;
+        uint bo_rem = blk_byte % 4u;
+
+        float d = unpackHalf2x16(rb(bo, bo_rem + 208u) | (rb(bo, bo_rem + 209u) << 8u)).x;
+
+        uint sc_raw = rb(bo, bo_rem + 192u + grp);
+        int sc_signed = int(sc_raw) - ((sc_raw >= 128u) ? 256 : 0);
+        float sc = d * float(sc_signed);
+
+        uint g_half = grp / 8u;
+        uint quad = (grp % 8u) / 2u;
+        uint grp_half = grp % 2u;
+        uint k_base = blk * BLOCK_ELEMS + grp * 16u;
+        float sum_q = 0.0;
+
+        for (uint j = 0; j < 4u; j++) {
+            uint l = grp_half * 16u + j * 4u;
+            uint ql_idx = g_half * 64u + l + (quad & 1u) * 32u;
+            uint ql_shift = (quad < 2u) ? 0u : 4u;
+            uint qh_byte_off = 128u + g_half * 32u + l;
+            uint qh_shift = quad * 2u;
+
+            uint ki = a_off + k_base + j * 4u;
+            float a0 = a[ki]; float a1 = a[ki+1u]; float a2 = a[ki+2u]; float a3 = a[ki+3u];
+
+            uint ql0 = (rb(bo, bo_rem + ql_idx)      >> ql_shift) & 0xFu;
+            uint ql1 = (rb(bo, bo_rem + ql_idx + 1u)  >> ql_shift) & 0xFu;
+            uint ql2 = (rb(bo, bo_rem + ql_idx + 2u)  >> ql_shift) & 0xFu;
+            uint ql3 = (rb(bo, bo_rem + ql_idx + 3u)  >> ql_shift) & 0xFu;
+
+            uint qh0 = (rb(bo, bo_rem + qh_byte_off)      >> qh_shift) & 0x3u;
+            uint qh1 = (rb(bo, bo_rem + qh_byte_off + 1u)  >> qh_shift) & 0x3u;
+            uint qh2 = (rb(bo, bo_rem + qh_byte_off + 2u)  >> qh_shift) & 0x3u;
+            uint qh3 = (rb(bo, bo_rem + qh_byte_off + 3u)  >> qh_shift) & 0x3u;
+
+            sum_q += a0 * float(int(ql0 | (qh0 << 4u)) - 32)
+                   + a1 * float(int(ql1 | (qh1 << 4u)) - 32)
+                   + a2 * float(int(ql2 | (qh2 << 4u)) - 32)
+                   + a3 * float(int(ql3 | (qh3 << 4u)) - 32);
+        }
+        partial += sum_q * sc;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[m * params.N + n] = sum;
+}

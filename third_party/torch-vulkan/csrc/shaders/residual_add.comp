@@ -1,0 +1,18 @@
+#version 450
+// Element-wise residual add: c[i] = a[i] + b[i]
+// Push: N (number of elements)
+// Dispatch: [ceil(N/256), 1, 1]
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a_data[]; };
+layout(set = 0, binding = 1) buffer BufB { float b_data[]; };
+layout(set = 0, binding = 2) buffer BufC { float c_data[]; };
+
+layout(push_constant) uniform PushConstants { uint N; } params;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.N) return;
+    c_data[i] = a_data[i] + b_data[i];
+}

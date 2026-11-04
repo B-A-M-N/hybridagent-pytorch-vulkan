@@ -1,0 +1,68 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// GPU-native Q5 matmul — sub-block processing.
+// Each thread processes a full 32-element sub-block per iteration.
+//
+// Per block (320B per 256 elements):
+//   f32[8] scales  (offset 0)   — pre-decoded: d * sc_val
+//   f32[8] mins    (offset 32)  — pre-decoded: dmin * mn_val
+//   u8[256] quants (offset 64)  — 5-bit values in low 5 bits, 4 per uint32
+//
+// Dispatch: [N, 1, 1] workgroups of 64 (wave64).
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+#define BLOCK_U32S 80   // 320 bytes / 4
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { uint w_data[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; } params;
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint total_subblocks = bpr * 8u;
+    uint row_off = n * bpr * BLOCK_U32S;
+    float partial = 0.0;
+
+    for (uint sb = tid; sb < total_subblocks; sb += WG_SIZE) {
+        uint blk = sb / 8u;
+        uint sub = sb % 8u;
+        uint bo = row_off + blk * BLOCK_U32S;
+
+        float sc = uintBitsToFloat(w_data[bo + sub]);
+        float mn = uintBitsToFloat(w_data[bo + 8u + sub]);
+
+        uint k_base = blk * BLOCK_ELEMS + sub * 32u;
+        // Q5 quants: 32 bytes per sub-block = 8 uint32s
+        uint q_base = bo + 16u + sub * 8u;
+
+        float sum_aq = 0.0;
+        float sum_a = 0.0;
+
+        // 8 quant words × 4 elements each = 32 elements
+        for (uint j = 0; j < 8u; j++) {
+            uint qw = w_data[q_base + j];
+            uint ki = k_base + j * 4u;
+            float a0 = a[ki]; float a1 = a[ki+1u]; float a2 = a[ki+2u]; float a3 = a[ki+3u];
+
+            sum_aq += a0 * float( qw        & 0x1Fu)
+                    + a1 * float((qw >>  8u) & 0x1Fu)
+                    + a2 * float((qw >> 16u) & 0x1Fu)
+                    + a3 * float((qw >> 24u) & 0x1Fu);
+            sum_a += a0 + a1 + a2 + a3;
+        }
+
+        partial += sum_aq * sc - sum_a * mn;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n] = sum;
+}

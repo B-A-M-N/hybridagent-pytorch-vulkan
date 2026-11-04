@@ -1,0 +1,71 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Parallel argmax: find index of maximum value in a float array.
+// Two-pass: first each workgroup finds local max, then WG 0 combines.
+//
+// Bindings: 0=input[N], 1=scratch[n_workgroups*2] (val,idx pairs), 2=result[1] (uint)
+// Push: N, n_workgroups
+// Dispatch: [n_workgroups, 1, 1]
+
+#define WG_SIZE 256
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufIn      { float values[]; };
+layout(set = 0, binding = 1) buffer BufScratch { float scratch[]; };  // [n_wg * 2]: alternating (val, idx_as_float)
+layout(set = 0, binding = 2) buffer BufResult  { uint result; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint n_workgroups;
+} params;
+
+shared float s_val[WG_SIZE];
+shared uint  s_idx[WG_SIZE];
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = wg * WG_SIZE + tid;
+
+    // Phase 1: Each thread finds max in its stride
+    float best_val = -1e30;
+    uint  best_idx = 0u;
+    for (uint i = gid; i < params.N; i += WG_SIZE * params.n_workgroups) {
+        float v = values[i];
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+
+    s_val[tid] = best_val;
+    s_idx[tid] = best_idx;
+    barrier();
+
+    // Shared memory reduction within workgroup
+    for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+        if (tid < s && s_val[tid + s] > s_val[tid]) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        barrier();
+    }
+
+    // Thread 0 writes workgroup result to scratch
+    if (tid == 0u) {
+        scratch[wg * 2u] = s_val[0];
+        scratch[wg * 2u + 1u] = uintBitsToFloat(s_idx[0]);
+    }
+
+    barrier();
+    memoryBarrierBuffer();
+
+    // Workgroup 0 combines all workgroup results
+    if (wg == 0u && tid == 0u) {
+        float final_val = -1e30;
+        uint final_idx = 0u;
+        for (uint w = 0u; w < params.n_workgroups; w++) {
+            float v = scratch[w * 2u];
+            uint idx = floatBitsToUint(scratch[w * 2u + 1u]);
+            if (v > final_val) { final_val = v; final_idx = idx; }
+        }
+        result = final_idx;
+    }
+}

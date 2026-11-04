@@ -1,0 +1,35 @@
+[project]
+name = "hybrid-agent"
+version = "0.1.0"
+description = "Hybrid Reasoning Agents: think in latent space, act through text."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+  "torch>=2.6",
+  "transformers>=4.56",
+  "accelerate>=1.0",
+  "safetensors>=0.4",
+  "huggingface-hub>=0.25",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "math-verify>=0.7",
+  "tavily-python>=0.5",
+  "python-dotenv",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+sft = ["deepspeed>=0.15"]
+wandb = ["wandb"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hybrid_agent*", "hybrid_sft*", "hybrid_rl*", "hybrid_inference*", "interpretable_latent_mode*"]
+
+[tool.setuptools.package-data]
+"hybrid_sft" = ["configs/*.yaml", "configs/*.json"]

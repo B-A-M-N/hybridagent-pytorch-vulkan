@@ -1,0 +1,66 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// GPU-native Q6 matmul — sub-group processing.
+// Each thread processes a full 16-element group per iteration.
+//
+// Per block (320B per 256 elements):
+//   f32[16] scales (offset 0)   — pre-decoded: d * int8(scale), 16 groups
+//   u8[256] quants (offset 64)  — 6-bit unsigned values (0-63), 4 per uint32
+//
+// Q6_K: signed, w = (qi - 32) * scale. No min term.
+// Dispatch: [N, 1, 1] workgroups of 64 (wave64).
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+#define BLOCK_U32S 80   // 320 bytes / 4
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { uint w_data[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; } params;
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint total_groups = bpr * 16u;  // 16 groups per block
+    uint row_off = n * bpr * BLOCK_U32S;
+    float partial = 0.0;
+
+    for (uint g = tid; g < total_groups; g += WG_SIZE) {
+        uint blk = g / 16u;
+        uint grp = g % 16u;
+        uint bo = row_off + blk * BLOCK_U32S;
+
+        // 1 scale per 16-element group
+        float sc = uintBitsToFloat(w_data[bo + grp]);
+
+        uint k_base = blk * BLOCK_ELEMS + grp * 16u;
+        // 16 elements = 4 uint32s of quants
+        uint q_base = bo + 16u + grp * 4u;
+
+        float sum_q = 0.0;
+
+        // 4 quant words × 4 elements = 16 elements
+        for (uint j = 0; j < 4u; j++) {
+            uint qw = w_data[q_base + j];
+            uint ki = k_base + j * 4u;
+            float a0 = a[ki]; float a1 = a[ki+1u]; float a2 = a[ki+2u]; float a3 = a[ki+3u];
+
+            sum_q += a0 * float(int( qw        & 0x3Fu) - 32)
+                   + a1 * float(int((qw >>  8u) & 0x3Fu) - 32)
+                   + a2 * float(int((qw >> 16u) & 0x3Fu) - 32)
+                   + a3 * float(int((qw >> 24u) & 0x3Fu) - 32);
+        }
+
+        partial += sum_q * sc;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n] = sum;
+}

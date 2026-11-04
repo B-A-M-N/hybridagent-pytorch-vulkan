@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.num_elements) return;
+    out_data[gid] = a[gid] * b[gid];
+}

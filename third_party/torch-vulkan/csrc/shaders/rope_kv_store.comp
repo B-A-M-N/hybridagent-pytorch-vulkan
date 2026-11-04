@@ -1,0 +1,83 @@
+#version 450
+// Fused RoPE + KV store — eliminates one dispatch + one barrier.
+// Phase 1 (threads 0..rope_pairs-1): Apply RoPE to Q and K in the QKV buffer.
+// Phase 2 (threads 0..kv_len/2-1): Pack K/V from QKV buffer into f16 KV cache.
+// Both phases touch gpu_qkv: RoPE modifies Q/K in-place, kv_store reads K/V.
+// Since we're a single dispatch, no barrier needed between them.
+//
+// Bindings: 0=qkv, 1=rope_factors, 2=k_cache(f16), 3=v_cache(f16)
+// Push: pos, n_heads, n_kv_heads, head_dim, rope_dim, q_len, kv_len
+// Dispatch: [ceil(max(rope_pairs, kv_len/2) / 64), 1, 1]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer BufQKV    { float qkv[]; };
+layout(set = 0, binding = 1) buffer BufFactors { float factors[]; };
+layout(set = 0, binding = 2) buffer BufK      { uint k_cache[]; };
+layout(set = 0, binding = 3) buffer BufV      { uint v_cache[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint pos;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint rope_dim;
+    uint q_len;      // n_heads * head_dim
+    uint kv_len;     // n_kv_heads * head_dim
+} params;
+
+const float ROPE_THETA = 10000.0;
+const float ATTN_FACTOR = 1.190238;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    // --- Phase 1: RoPE ---
+    uint total_heads = params.n_heads + params.n_kv_heads;
+    uint pairs_per_head = params.rope_dim / 2u;
+    uint total_pairs = total_heads * pairs_per_head;
+
+    if (gid < total_pairs) {
+        uint h = gid / pairs_per_head;
+        uint i = gid % pairs_per_head;
+
+        uint base;
+        if (h < params.n_heads) {
+            base = h * params.head_dim;
+        } else {
+            base = params.n_heads * params.head_dim + (h - params.n_heads) * params.head_dim;
+        }
+
+        float base_freq = 1.0 / pow(ROPE_THETA, 2.0 * float(i) / float(params.rope_dim));
+        float factor = (i < factors.length()) ? factors[i] : 1.0;
+        float freq = base_freq / factor;
+        float angle = float(params.pos) * freq;
+        float cos_t = cos(angle) * ATTN_FACTOR;
+        float sin_t = sin(angle) * ATTN_FACTOR;
+
+        float x0 = qkv[base + 2u * i];
+        float x1 = qkv[base + 2u * i + 1u];
+        qkv[base + 2u * i]      = x0 * cos_t - x1 * sin_t;
+        qkv[base + 2u * i + 1u] = x0 * sin_t + x1 * cos_t;
+    }
+
+    // Shared memory barrier to ensure RoPE writes are visible to KV store
+    memoryBarrierBuffer();
+    barrier();
+
+    // --- Phase 2: KV store (f32 → f16 packing) ---
+    uint half_kv = params.kv_len / 2u;
+    if (gid < half_kv) {
+        uint e0 = gid * 2u;
+        uint e1 = e0 + 1u;
+        uint cache_base = params.pos * params.kv_len;
+
+        float k0 = qkv[params.q_len + e0];
+        float k1 = qkv[params.q_len + e1];
+        k_cache[(cache_base + e0) / 2u] = packHalf2x16(vec2(k0, k1));
+
+        float v0 = qkv[params.q_len + params.kv_len + e0];
+        float v1 = qkv[params.q_len + params.kv_len + e1];
+        v_cache[(cache_base + e0) / 2u] = packHalf2x16(vec2(v0, v1));
+    }
+}

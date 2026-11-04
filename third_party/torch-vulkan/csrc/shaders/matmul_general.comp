@@ -1,0 +1,25 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} params;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    if (row >= params.M || col >= params.N) return;
+
+    float sum = 0.0;
+    for (uint i = 0; i < params.K; i++) {
+        sum += a[row * params.K + i] * b[i * params.N + col];
+    }
+    c[row * params.N + col] = sum;
+}

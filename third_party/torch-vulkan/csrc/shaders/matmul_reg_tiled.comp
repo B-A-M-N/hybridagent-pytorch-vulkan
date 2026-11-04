@@ -1,0 +1,93 @@
+#version 450
+/*
+ * Register-tiled matmul: each thread computes a 4x4 block of outputs.
+ * 16x more work per thread than naive tiled, same shared memory loads.
+ * Workgroup: 16x16 threads, each computing 4x4 = 64x64 output tile per workgroup.
+ */
+
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 16
+#define THREAD_M 4
+#define THREAD_N 4
+#define WG_M 16  // TILE_M / THREAD_M
+#define WG_N 16  // TILE_N / THREAD_N
+
+layout(local_size_x = WG_N, local_size_y = WG_M) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { float b[]; };
+layout(set = 0, binding = 2) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} params;
+
+shared float tileA[TILE_M][TILE_K];
+shared float tileB[TILE_K][TILE_N];
+
+void main() {
+    uint wg_row = gl_WorkGroupID.y * TILE_M;
+    uint wg_col = gl_WorkGroupID.x * TILE_N;
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+
+    // Each thread accumulates a THREAD_M x THREAD_N block
+    float acc[THREAD_M][THREAD_N];
+    for (int i = 0; i < THREAD_M; i++)
+        for (int j = 0; j < THREAD_N; j++)
+            acc[i][j] = 0.0;
+
+    uint numTilesK = (params.K + TILE_K - 1) / TILE_K;
+
+    for (uint tk = 0; tk < numTilesK; tk++) {
+        // Collaborative load of A tile [TILE_M x TILE_K]
+        // Each thread loads THREAD_M rows
+        for (uint i = 0; i < THREAD_M; i++) {
+            uint row = wg_row + local_row * THREAD_M + i;
+            uint col = tk * TILE_K + local_col;
+            if (row < params.M && col < params.K)
+                tileA[local_row * THREAD_M + i][local_col] = a[row * params.K + col];
+            else
+                tileA[local_row * THREAD_M + i][local_col] = 0.0;
+        }
+
+        // Collaborative load of B tile [TILE_K x TILE_N]
+        // Each thread loads THREAD_N columns
+        for (uint j = 0; j < THREAD_N; j++) {
+            uint row = tk * TILE_K + local_row;
+            uint col = wg_col + local_col * THREAD_N + j;
+            if (row < params.K && col < params.N)
+                tileB[local_row][local_col * THREAD_N + j] = b[row * params.N + col];
+            else
+                tileB[local_row][local_col * THREAD_N + j] = 0.0;
+        }
+
+        barrier();
+
+        // Compute: each thread does THREAD_M x THREAD_N dot products
+        for (uint kk = 0; kk < TILE_K; kk++) {
+            for (uint i = 0; i < THREAD_M; i++) {
+                float a_val = tileA[local_row * THREAD_M + i][kk];
+                for (uint j = 0; j < THREAD_N; j++) {
+                    acc[i][j] += a_val * tileB[kk][local_col * THREAD_N + j];
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write results
+    for (uint i = 0; i < THREAD_M; i++) {
+        for (uint j = 0; j < THREAD_N; j++) {
+            uint row = wg_row + local_row * THREAD_M + i;
+            uint col = wg_col + local_col * THREAD_N + j;
+            if (row < params.M && col < params.N) {
+                c[row * params.N + col] = acc[i][j];
+            }
+        }
+    }
+}

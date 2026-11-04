@@ -1,0 +1,13 @@
+[tool.ruff]
+# torch-vulkan is a thin Python shim over a C++/Vulkan extension; keep linting
+# focused on real problems (pyflakes + import sorting) rather than style churn.
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+# E402 (module-level import not at top of file) is intentionally allowed: the
+# package must import `torch` first, then load the `_C` extension that registers
+# the PrivateUse1 backend, and finally alias the module into `torch.vulkan` --
+# all of which happen mid-module by design.
+ignore = ["E402"]

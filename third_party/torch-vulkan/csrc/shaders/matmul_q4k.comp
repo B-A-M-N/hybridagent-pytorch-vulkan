@@ -1,0 +1,105 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Q4_K matmul — raw GGUF format, superblock processing.
+// 64 threads = 1 wave. Each thread processes full sub-blocks,
+// amortizing the 6-bit scale decode across 32 elements.
+//
+// Q4_K block (144B per 256 elements):
+//   [0:2]   d     (fp16)
+//   [2:4]   dmin  (fp16)
+//   [4:16]  scales[12] (6-bit packed)
+//   [16:144] qs[128]   (4-bit nibble pairs)
+//
+// qs layout: byte qs[pair*32+j] holds elements (pair*2)*32+j (lo nibble)
+//            and (pair*2+1)*32+j (hi nibble). pair = sub/2.
+//
+// Dispatch: [N, 1, 1] workgroups of 64.
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+#define BLOCK_BYTES 144
+#define BLOCK_U32S 36   // 144 / 4
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; uint out_offset; } params;
+
+// Read byte at byte offset from uint buffer
+uint rb(uint base, uint off) {
+    return (w[base + (off >> 2u)] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint total_subblocks = bpr * 8u;
+    // row_off in uint32s
+    uint row_off = n * bpr * BLOCK_U32S;
+    float partial = 0.0;
+
+    for (uint sb = tid; sb < total_subblocks; sb += WG_SIZE) {
+        uint blk = sb / 8u;
+        uint sub = sb % 8u;
+        uint bo = row_off + blk * BLOCK_U32S;  // block start in uint32s
+
+        // --- Decode d, dmin (fp16, 2 bytes each at byte offset 0 and 2) ---
+        uint dm_word = w[bo];  // bytes 0-3: contains both d and dmin
+        float d    = unpackHalf2x16(dm_word).x;       // bytes 0-1
+        float dmin = unpackHalf2x16(dm_word).y;       // bytes 2-3
+
+        // --- Decode 6-bit scale and min for this sub-block ---
+        // scales[12] at byte offset 4, which is uint32 offset 1
+        uint sc_val, mn_val;
+        if (sub < 4u) {
+            sc_val = rb(bo, 4u + sub) & 0x3Fu;
+            mn_val = rb(bo, 8u + sub) & 0x3Fu;
+        } else {
+            uint i = sub - 4u;
+            sc_val = (rb(bo, 12u + i) & 0x0Fu) | ((rb(bo, 4u + i) >> 6u) << 4u);
+            mn_val = (rb(bo, 12u + i) >> 4u)    | ((rb(bo, 8u + i) >> 6u) << 4u);
+        }
+        float sc = d * float(sc_val);
+        float mn = dmin * float(mn_val);
+
+        // --- Process 32 elements in this sub-block ---
+        // qs at byte offset 16 = uint32 offset 4
+        // pair = sub/2, byte offset within qs = pair*32
+        // lo nibble = even sub, hi nibble = odd sub
+        uint pair = sub / 2u;
+        uint qs_byte_off = 16u + pair * 32u;  // byte offset of this pair's qs
+        uint qs_u32_off = bo + qs_byte_off / 4u;  // uint32 offset
+        uint nibble_shift = (sub & 1u) * 4u;  // 0 for even sub, 4 for odd
+
+        uint k_base = blk * BLOCK_ELEMS + sub * 32u;
+        float sum_aq = 0.0;
+        float sum_a = 0.0;
+
+        // 32 elements = 32 bytes of qs = 8 uint32s, but each byte has 2 nibbles
+        // We read 8 uint32s (32 bytes), extract the right nibble from each byte
+        for (uint j = 0; j < 8u; j++) {
+            uint qs_word = w[qs_u32_off + j];
+            uint ki = k_base + j * 4u;
+
+            // Each uint32 has 4 bytes, each byte has our nibble at nibble_shift
+            float a0 = a[ki]; float a1 = a[ki+1u]; float a2 = a[ki+2u]; float a3 = a[ki+3u];
+
+            sum_aq += a0 * float((qs_word >>  nibble_shift)        & 0xFu)
+                    + a1 * float((qs_word >> (nibble_shift + 8u))  & 0xFu)
+                    + a2 * float((qs_word >> (nibble_shift + 16u)) & 0xFu)
+                    + a3 * float((qs_word >> (nibble_shift + 24u)) & 0xFu);
+            sum_a += a0 + a1 + a2 + a3;
+        }
+
+        partial += sum_aq * sc - sum_a * mn;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n + params.out_offset] = sum;
+}

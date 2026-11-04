@@ -1,0 +1,57 @@
+#version 450
+// RoPE (Rotary Position Embedding) — in-place on QKV buffer.
+// Applies LongRoPE with short factors and attn_factor scaling.
+// Processes Q (n_heads) and K (n_kv_heads) in one dispatch.
+// V is left untouched.
+//
+// Bindings: 0=qkv[QKV_DIM], 1=rope_factors[ROPE_DIM/2]
+// Push: pos, n_heads, n_kv_heads, head_dim, rope_dim
+// Dispatch: [(n_heads + n_kv_heads) * (rope_dim/2), 1, 1]
+//   — one thread per (head, rotation_pair)
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer BufQKV    { float qkv[]; };
+layout(set = 0, binding = 1) buffer BufFactors { float factors[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint pos;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint rope_dim;
+} params;
+
+const float ROPE_THETA = 10000.0;
+const float ATTN_FACTOR = 1.190238;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total_heads = params.n_heads + params.n_kv_heads;
+    uint pairs_per_head = params.rope_dim / 2u;
+    uint total_pairs = total_heads * pairs_per_head;
+    if (gid >= total_pairs) return;
+
+    uint h = gid / pairs_per_head;
+    uint i = gid % pairs_per_head;
+
+    // Determine base offset: Q heads start at 0, K heads start after all Q heads
+    uint base;
+    if (h < params.n_heads) {
+        base = h * params.head_dim;
+    } else {
+        base = params.n_heads * params.head_dim + (h - params.n_heads) * params.head_dim;
+    }
+
+    float base_freq = 1.0 / pow(ROPE_THETA, 2.0 * float(i) / float(params.rope_dim));
+    float factor = (i < factors.length()) ? factors[i] : 1.0;
+    float freq = base_freq / factor;
+    float angle = float(params.pos) * freq;
+    float cos_t = cos(angle) * ATTN_FACTOR;
+    float sin_t = sin(angle) * ATTN_FACTOR;
+
+    float x0 = qkv[base + 2u * i];
+    float x1 = qkv[base + 2u * i + 1u];
+    qkv[base + 2u * i]      = x0 * cos_t - x1 * sin_t;
+    qkv[base + 2u * i + 1u] = x0 * sin_t + x1 * cos_t;
+}

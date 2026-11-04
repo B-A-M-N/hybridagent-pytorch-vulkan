@@ -1,0 +1,108 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Q5_K matmul — raw GGUF format, superblock processing.
+// 64 threads = 1 wave. Each thread processes a full 32-element sub-block.
+//
+// Q5_K block (176B per 256 elements):
+//   [0:2]    d     (fp16)
+//   [2:4]    dmin  (fp16)
+//   [4:16]   scales[12] (6-bit packed, same as Q4_K)
+//   [16:48]  qh[32]     (high bits: 1 bit per element, packed 8 per byte)
+//   [48:176] qs[128]    (low 4 bits, interleaved pairs like Q4_K)
+//
+// Dispatch: [N, 1, 1] workgroups of 64.
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+#define BLOCK_U32S 44   // 176 / 4
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; uint out_offset; } params;
+
+uint rb(uint base, uint off) {
+    return (w[base + (off >> 2u)] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint total_subblocks = bpr * 8u;
+    uint row_off = n * bpr * BLOCK_U32S;
+    float partial = 0.0;
+
+    for (uint sb = tid; sb < total_subblocks; sb += WG_SIZE) {
+        uint blk = sb / 8u;
+        uint sub = sb % 8u;
+        uint bo = row_off + blk * BLOCK_U32S;
+
+        // d, dmin from bytes 0-3
+        uint dm_word = w[bo];
+        float d    = unpackHalf2x16(dm_word).x;
+        float dmin = unpackHalf2x16(dm_word).y;
+
+        // 6-bit scale/min decode (scales at byte offset 4)
+        uint sc_val, mn_val;
+        if (sub < 4u) {
+            sc_val = rb(bo, 4u + sub) & 0x3Fu;
+            mn_val = rb(bo, 8u + sub) & 0x3Fu;
+        } else {
+            uint i = sub - 4u;
+            sc_val = (rb(bo, 12u + i) & 0x0Fu) | ((rb(bo, 4u + i) >> 6u) << 4u);
+            mn_val = (rb(bo, 12u + i) >> 4u)    | ((rb(bo, 8u + i) >> 6u) << 4u);
+        }
+        float sc = d * float(sc_val);
+        float mn = dmin * float(mn_val);
+
+        // qs at byte offset 48, qh at byte offset 16
+        uint pair = sub / 2u;
+        uint qs_u32_off = bo + (48u + pair * 32u) / 4u;
+        uint nibble_shift = (sub & 1u) * 4u;
+
+        uint k_base = blk * BLOCK_ELEMS + sub * 32u;
+        float sum_aq = 0.0;
+        float sum_a = 0.0;
+
+        for (uint j = 0; j < 8u; j++) {
+            uint qs_word = w[qs_u32_off + j];
+            uint ki = k_base + j * 4u;
+            // j indexes 4 bytes → elements j*4..j*4+3 within sub-block
+            uint elem_base = j * 4u;  // element offset within sub-block (0,4,8,...28)
+
+            float a0 = a[ki]; float a1 = a[ki+1u]; float a2 = a[ki+2u]; float a3 = a[ki+3u];
+
+            // Low 4 bits from qs
+            uint q0_lo = (qs_word >>  nibble_shift)        & 0xFu;
+            uint q1_lo = (qs_word >> (nibble_shift + 8u))  & 0xFu;
+            uint q2_lo = (qs_word >> (nibble_shift + 16u)) & 0xFu;
+            uint q3_lo = (qs_word >> (nibble_shift + 24u)) & 0xFu;
+
+            // High bit from qh[32] at byte offset 16
+            // Element e within block → qh byte = e % 32, bit = e / 32 = sub
+            uint e0 = sub * 32u + elem_base;
+            uint e1 = e0 + 1u; uint e2 = e0 + 2u; uint e3 = e0 + 3u;
+            uint qh0 = (rb(bo, 16u + (e0 % 32u)) >> sub) & 1u;
+            uint qh1 = (rb(bo, 16u + (e1 % 32u)) >> sub) & 1u;
+            uint qh2 = (rb(bo, 16u + (e2 % 32u)) >> sub) & 1u;
+            uint qh3 = (rb(bo, 16u + (e3 % 32u)) >> sub) & 1u;
+
+            sum_aq += a0 * float(q0_lo | (qh0 << 4u))
+                    + a1 * float(q1_lo | (qh1 << 4u))
+                    + a2 * float(q2_lo | (qh2 << 4u))
+                    + a3 * float(q3_lo | (qh3 << 4u));
+            sum_a += a0 + a1 + a2 + a3;
+        }
+
+        partial += sum_aq * sc - sum_a * mn;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n + params.out_offset] = sum;
+}

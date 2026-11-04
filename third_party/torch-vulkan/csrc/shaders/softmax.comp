@@ -1,0 +1,65 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufIn { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_rows;
+    uint row_size;
+} params;
+
+shared float shared_max[256];
+shared float shared_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (row >= params.num_rows) return;
+    
+    uint base = row * params.row_size;
+    
+    // Step 1: find max in this row (for numerical stability)
+    float local_max = -1e30;
+    for (uint i = tid; i < params.row_size; i += 256) {
+        local_max = max(local_max, in_data[base + i]);
+    }
+    shared_max[tid] = local_max;
+    barrier();
+    
+    // Parallel reduction for max
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
+        }
+        barrier();
+    }
+    float row_max = shared_max[0];
+    barrier();
+    
+    // Step 2: compute exp(x - max) and sum
+    float local_sum = 0.0;
+    for (uint i = tid; i < params.row_size; i += 256) {
+        float val = exp(in_data[base + i] - row_max);
+        out_data[base + i] = val;
+        local_sum += val;
+    }
+    shared_sum[tid] = local_sum;
+    barrier();
+    
+    // Parallel reduction for sum
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+    float row_sum = shared_sum[0];
+    barrier();
+    
+    // Step 3: divide by sum
+    for (uint i = tid; i < params.row_size; i += 256) {
+        out_data[base + i] /= row_sum;
+    }
+}

@@ -1,0 +1,53 @@
+#version 450
+/*
+ * RMS Norm: out[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps)
+ * One workgroup per row. Shared memory parallel reduction for mean(x^2).
+ */
+
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufIn { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufWeight { float weight[]; };
+layout(set = 0, binding = 2) buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_rows;
+    uint row_size;
+} params;
+
+shared float sdata[WG_SIZE];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint row_off = row * params.row_size;
+
+    if (row >= params.num_rows) return;
+
+    // Step 1: compute sum of squares (parallel reduction)
+    float sum_sq = 0.0;
+    for (uint i = tid; i < params.row_size; i += WG_SIZE) {
+        float v = in_data[row_off + i];
+        sum_sq += v * v;
+    }
+    sdata[tid] = sum_sq;
+    barrier();
+
+    // Reduce in shared memory
+    for (uint s = WG_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier();
+    }
+
+    // Step 2: normalize
+    float rms = sqrt(sdata[0] / float(params.row_size) + 1e-5);
+    float inv_rms = 1.0 / rms;
+
+    for (uint i = tid; i < params.row_size; i += WG_SIZE) {
+        out_data[row_off + i] = weight[i] * in_data[row_off + i] * inv_rms;
+    }
+}

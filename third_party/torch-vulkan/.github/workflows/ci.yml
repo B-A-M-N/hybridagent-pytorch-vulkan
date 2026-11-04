@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  shaders:
+    name: Compile SPIR-V shaders
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install glslang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+
+      # Compile every .comp to a scratch dir and fail if any shader does not
+      # compile. This guards the regression that the default `glslangValidator -V`
+      # (SPIR-V 1.0) could not build the subgroup-using quantized kernels, which
+      # need --target-env vulkan1.1 (SPIR-V 1.3).
+      - name: Compile all shaders
+        working-directory: csrc/shaders
+        run: |
+          set -euo pipefail
+          out="$(mktemp -d)"
+          fail=0
+          for comp in *.comp; do
+            echo "Compiling $comp"
+            if ! glslangValidator --target-env vulkan1.1 -V "$comp" -o "$out/${comp%.comp}.spv"; then
+              echo "::error file=csrc/shaders/$comp::shader failed to compile"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || { echo "One or more shaders failed to compile"; exit 1; }
+          echo "Compiled $(ls "$out"/*.spv | wc -l) shaders."
+
+  python-lint:
+    name: Python lint + syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      # py_compile catches syntax errors without needing the compiled _C
+      # extension (which requires a Vulkan GPU + Kompute + custom PyTorch and
+      # cannot run on a stock CI runner).
+      - name: Syntax check
+        run: |
+          python -m py_compile setup.py persistent_pipeline.py \
+            torch_vulkan/__init__.py tests/*.py
+
+      - name: Ruff
+        run: ruff check .
+
+# NOTE: The C++ extension build (CMake + Torch + Kompute) and the runtime test
+# suite require a Vulkan-capable GPU and are not run here -- GitHub-hosted
+# runners have no GPU. Build/test verification is done locally on the target
+# hardware (AMD Radeon 890M / RADV). This workflow verifies what can be checked
+# without a GPU: shader compilation and Python static checks.

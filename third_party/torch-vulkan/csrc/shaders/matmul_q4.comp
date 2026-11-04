@@ -1,0 +1,88 @@
+#version 450
+/*
+ * Tiled matmul with Q4 dequantization.
+ * A: float32 [M, K] (activations, always float)
+ * B: packed Q4 [K/2, N] as uint8 (weights, 2 values per byte)
+ * B_scales: float32 [K/32, N] (one scale per block of 32)
+ * C: float32 [M, N] (output)
+ *
+ * Each byte in B holds two 4-bit values (low nibble, high nibble).
+ * Dequant: value = (nibble - 8) * scale
+ */
+
+#define TILE_SIZE 16
+#define Q4_BLOCK_SIZE 32
+
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufA { float a[]; };
+layout(set = 0, binding = 1) buffer BufB { uint b_packed[]; };  // packed uint32s
+layout(set = 0, binding = 2) buffer BufScales { float b_scales[]; };
+layout(set = 0, binding = 3) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+} params;
+
+shared float tileA[TILE_SIZE][TILE_SIZE];
+shared float tileB[TILE_SIZE][TILE_SIZE];
+
+// Dequantize one Q4 value from packed byte stream
+float dequant_q4(uint k_idx, uint n_idx) {
+    // Each uint32 holds 8 nibbles = 8 values
+    // Linear index into packed buffer: (k_idx * N + n_idx)
+    uint linear = k_idx * params.N + n_idx;
+    uint word_idx = linear / 8;
+    uint nibble_idx = linear % 8;
+
+    uint word = b_packed[word_idx];
+    uint nibble = (word >> (nibble_idx * 4)) & 0xFu;
+
+    // Scale: one per block of 32 along K dimension
+    uint scale_k = k_idx / Q4_BLOCK_SIZE;
+    float scale = b_scales[scale_k * params.N + n_idx];
+
+    return (float(nibble) - 8.0) * scale;
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint localRow = gl_LocalInvocationID.y;
+    uint localCol = gl_LocalInvocationID.x;
+
+    float sum = 0.0;
+    uint numTiles = (params.K + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        // Load tile of A (float32)
+        uint aCol = t * TILE_SIZE + localCol;
+        if (row < params.M && aCol < params.K) {
+            tileA[localRow][localCol] = a[row * params.K + aCol];
+        } else {
+            tileA[localRow][localCol] = 0.0;
+        }
+
+        // Load tile of B (dequantize Q4 on the fly)
+        uint bRow = t * TILE_SIZE + localRow;
+        if (bRow < params.K && col < params.N) {
+            tileB[localRow][localCol] = dequant_q4(bRow, col);
+        } else {
+            tileB[localRow][localCol] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += tileA[localRow][k] * tileB[k][localCol];
+        }
+
+        barrier();
+    }
+
+    if (row < params.M && col < params.N) {
+        c[row * params.N + col] = sum;
+    }
+}

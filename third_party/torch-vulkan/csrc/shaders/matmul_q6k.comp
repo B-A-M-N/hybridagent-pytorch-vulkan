@@ -1,0 +1,106 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Q6_K matmul — raw GGUF format, group processing.
+// 64 threads = 1 wave. Each thread processes a 16-element group,
+// amortizing scale decode.
+//
+// Q6_K block (210B per 256 elements):
+//   [0:128]   ql[128]    (low 4 bits)
+//   [128:192] qh[64]     (high 2 bits)
+//   [192:208] scales[16] (int8, one per 16 elements)
+//   [208:210] d          (fp16)
+//
+// 6-bit quant: q = ql_lo4 | (qh_2bit << 4), signed: w = (q - 32) * d * scale
+//
+// Dispatch: [N, 1, 1] workgroups of 64.
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+#define BLOCK_U32S 53   // ceil(210/4) — but we use byte math
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; uint out_offset; } params;
+
+uint rb(uint base_u32, uint byte_off) {
+    return (w[base_u32 + (byte_off >> 2u)] >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint total_groups = bpr * 16u;  // 16 groups of 16 elements per block
+    // row_off in BYTES (Q6_K blocks are 210 bytes, not aligned to 4)
+    uint row_byte_off = n * bpr * 210u;
+    float partial = 0.0;
+
+    for (uint g = tid; g < total_groups; g += WG_SIZE) {
+        uint blk = g / 16u;
+        uint grp = g % 16u;
+        // Block byte offset — use byte arithmetic since 210 isn't uint32 aligned
+        uint blk_byte = row_byte_off + blk * 210u;
+        // Convert to uint32 base (floor)
+        uint bo = blk_byte / 4u;
+        uint bo_rem = blk_byte % 4u;  // byte remainder for rb offset
+
+        // d at byte offset 208
+        float d = unpackHalf2x16(rb(bo, bo_rem + 208u) | (rb(bo, bo_rem + 209u) << 8u)).x;
+
+        // scale: int8 at byte offset 192 + grp
+        uint sc_raw = rb(bo, bo_rem + 192u + grp);
+        int sc_signed = int(sc_raw) - ((sc_raw >= 128u) ? 256 : 0);
+        float sc = d * float(sc_signed);
+
+        // Decode 16 elements in this group
+        // group index: g_half = grp/8 (0 or 1), quad = (grp%8)/2 (0-3), half = grp%2
+        uint g_half = grp / 8u;          // which 128-element half
+        uint quad = (grp % 8u) / 2u;     // which 32-element quad within half
+        uint grp_half = grp % 2u;            // which 16 within quad
+
+        uint k_base = blk * BLOCK_ELEMS + grp * 16u;
+        float sum_q = 0.0;
+
+        for (uint j = 0; j < 4u; j++) {
+            uint l = grp_half * 16u + j * 4u;  // element offset within quad's 32
+
+            // ql: byte at offset ql_idx where ql_idx = g_half*64 + l + (quad&1)*32
+            // quad < 2: use low nibble; quad >= 2: use high nibble
+            uint ql_idx = g_half * 64u + l + (quad & 1u) * 32u;
+            uint ql_shift = (quad < 2u) ? 0u : 4u;
+
+            // qh: byte at offset 128 + g_half*32 + l, bits at quad*2
+            uint qh_byte_off = 128u + g_half * 32u + l;
+            uint qh_shift = quad * 2u;
+
+            uint ki = k_base + j * 4u;
+            float a0 = a[ki]; float a1 = a[ki+1u]; float a2 = a[ki+2u]; float a3 = a[ki+3u];
+
+            uint ql0 = (rb(bo, bo_rem + ql_idx)      >> ql_shift) & 0xFu;
+            uint ql1 = (rb(bo, bo_rem + ql_idx + 1u)  >> ql_shift) & 0xFu;
+            uint ql2 = (rb(bo, bo_rem + ql_idx + 2u)  >> ql_shift) & 0xFu;
+            uint ql3 = (rb(bo, bo_rem + ql_idx + 3u)  >> ql_shift) & 0xFu;
+
+            uint qh0 = (rb(bo, bo_rem + qh_byte_off)      >> qh_shift) & 0x3u;
+            uint qh1 = (rb(bo, bo_rem + qh_byte_off + 1u)  >> qh_shift) & 0x3u;
+            uint qh2 = (rb(bo, bo_rem + qh_byte_off + 2u)  >> qh_shift) & 0x3u;
+            uint qh3 = (rb(bo, bo_rem + qh_byte_off + 3u)  >> qh_shift) & 0x3u;
+
+            sum_q += a0 * float(int(ql0 | (qh0 << 4u)) - 32)
+                   + a1 * float(int(ql1 | (qh1 << 4u)) - 32)
+                   + a2 * float(int(ql2 | (qh2 << 4u)) - 32)
+                   + a3 * float(int(ql3 | (qh3 << 4u)) - 32);
+        }
+
+        partial += sum_q * sc;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n + params.out_offset] = sum;
+}

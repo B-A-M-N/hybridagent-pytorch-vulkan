@@ -1,0 +1,82 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// GPU-native Q4 matmul — sub-block processing.
+// Each thread processes a full 32-element sub-block per iteration,
+// amortizing scale/min loads across 32 elements.
+//
+// Per block (192B per 256 elements):
+//   f32[8] scales (offset 0)    — pre-decoded: d * sc_val
+//   f32[8] mins   (offset 32)   — pre-decoded: dmin * mn_val
+//   u32[32] nibbles (offset 64) — element e at word[e/8] bits [(e%8)*4 +: 4]
+//
+// Dispatch: [N, 1, 1] workgroups of 64 (wave64).
+
+#define WG_SIZE 64
+#define BLOCK_ELEMS 256
+#define BLOCK_U32S 48   // 192 bytes / 4
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { uint w_data[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; } params;
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint bpr = params.K / BLOCK_ELEMS;
+    uint total_subblocks = bpr * 8u;
+    uint row_off = n * bpr * BLOCK_U32S;
+    float partial = 0.0;
+
+    for (uint sb = tid; sb < total_subblocks; sb += WG_SIZE) {
+        uint blk = sb / 8u;
+        uint sub = sb % 8u;
+        uint bo = row_off + blk * BLOCK_U32S;
+
+        // 1 scale + 1 min, reused for all 32 elements in this sub-block
+        float sc = uintBitsToFloat(w_data[bo + sub]);
+        float mn = uintBitsToFloat(w_data[bo + 8u + sub]);
+
+        uint k_base = blk * BLOCK_ELEMS + sub * 32u;
+        uint nib_base = bo + 16u + sub * 4u;
+
+        // Separate accumulation: result = sc * sum(a*qi) - mn * sum(a)
+        float sum_aq = 0.0;
+        float sum_a = 0.0;
+
+        // 4 nibble words × 8 elements each = 32 elements
+        uint nib0 = w_data[nib_base     ];
+        uint nib1 = w_data[nib_base + 1u];
+        uint nib2 = w_data[nib_base + 2u];
+        uint nib3 = w_data[nib_base + 3u];
+
+        uint ki = k_base;
+
+        #define ACCUM8(NW, KOFF) {                                        \
+            float a0=a[KOFF],a1=a[KOFF+1u],a2=a[KOFF+2u],a3=a[KOFF+3u]; \
+            float a4=a[KOFF+4u],a5=a[KOFF+5u],a6=a[KOFF+6u],a7=a[KOFF+7u]; \
+            sum_aq += a0*float( NW     &0xFu) + a1*float((NW>> 4u)&0xFu) \
+                    + a2*float((NW>> 8u)&0xFu) + a3*float((NW>>12u)&0xFu) \
+                    + a4*float((NW>>16u)&0xFu) + a5*float((NW>>20u)&0xFu) \
+                    + a6*float((NW>>24u)&0xFu) + a7*float( NW>>28u);      \
+            sum_a += a0+a1+a2+a3+a4+a5+a6+a7;                            \
+        }
+
+        ACCUM8(nib0, ki)
+        ACCUM8(nib1, ki + 8u)
+        ACCUM8(nib2, ki + 16u)
+        ACCUM8(nib3, ki + 24u)
+
+        #undef ACCUM8
+
+        partial += sum_aq * sc - sum_a * mn;
+    }
+
+    float sum = subgroupAdd(partial);
+    if (tid == 0u) c[n] = sum;
+}

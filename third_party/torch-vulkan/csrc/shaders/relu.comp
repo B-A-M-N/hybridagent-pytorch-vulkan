@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufIn { float in_data[]; };
+layout(set = 0, binding = 1) buffer BufOut { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.num_elements) return;
+    out_data[gid] = max(0.0, in_data[gid]);
+}

@@ -1,0 +1,94 @@
+#version 450
+// Fused RMS norm + Q4_K matmul.
+// Step 1: All workgroups cooperatively compute RMS norm of input into shared memory.
+// Step 2: Each workgroup computes one output element using normed input × Q4_K weights.
+//
+// Bindings: 0=raw_input[K], 1=norm_weights[K], 2=q4k_weights[N*blocks], 3=output[N]
+// Push: K, N
+// Dispatch: [N, 1, 1]
+//
+// Key insight: every workgroup needs the FULL normed input vector. We compute norm
+// once using workgroup 0's reduction, store inv_rms, then all workgroups apply norm
+// on-the-fly during the dot product (no intermediate buffer needed).
+
+#define WG_SIZE 256
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) buffer BufIn     { float raw_in[]; };
+layout(set = 0, binding = 1) buffer BufNorm   { float norm_w[]; };
+layout(set = 0, binding = 2) buffer BufWeight { uint b_data[]; };
+layout(set = 0, binding = 3) buffer BufOut    { float c[]; };
+
+layout(push_constant) uniform PushConstants { uint K; uint N; } params;
+
+shared float sdata[WG_SIZE];
+
+uint rb(uint off) { return (b_data[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu; }
+float fp16(uint off) { return unpackHalf2x16(rb(off) | (rb(off+1u)<<8u)).x; }
+
+void main() {
+    uint n = gl_WorkGroupID.x;
+    if (n >= params.N) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Step 1: Compute inv_rms from raw input (all workgroups do this independently)
+    float sum_sq = 0.0;
+    for (uint i = tid; i < params.K; i += WG_SIZE) {
+        float v = raw_in[i];
+        sum_sq += v * v;
+    }
+    sdata[tid] = sum_sq;
+    barrier();
+    for (uint s = WG_SIZE/2u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(params.K) + 1e-5);
+
+    // Step 2: Q4_K matmul using normed input on-the-fly
+    uint bpr = params.K / 256u;
+    uint row_off = n * bpr * 144u;
+    float partial = 0.0;
+
+    for (uint k = tid; k < params.K; k += WG_SIZE) {
+        // Apply norm on-the-fly: normed[k] = norm_w[k] * raw_in[k] * inv_rms
+        float a_val = norm_w[k] * raw_in[k] * inv_rms;
+
+        uint blk = k / 256u;
+        uint pos = k % 256u;
+        uint bo = row_off + blk * 144u;
+
+        float d = fp16(bo);
+        float dmin = fp16(bo + 2u);
+
+        uint sub = pos / 32u;
+        uint j = pos % 32u;
+
+        uint sc_val, mn_val;
+        if (sub < 4u) {
+            sc_val = rb(bo + 4u + sub) & 0x3Fu;
+            mn_val = rb(bo + 8u + sub) & 0x3Fu;
+        } else {
+            uint i = sub - 4u;
+            sc_val = (rb(bo + 12u + i) & 0x0Fu) | ((rb(bo + 4u + i) >> 6u) << 4u);
+            mn_val = (rb(bo + 12u + i) >> 4u) | ((rb(bo + 8u + i) >> 6u) << 4u);
+        }
+        float sc = d * float(sc_val);
+        float mn = dmin * float(mn_val);
+
+        uint pair = sub / 2u;
+        uint q_byte = rb(bo + 16u + pair * 32u + j);
+        uint qi = ((sub & 1u) == 0u) ? (q_byte & 0x0Fu) : ((q_byte >> 4u) & 0x0Fu);
+
+        float w = float(qi) * sc - mn;
+        partial += a_val * w;
+    }
+
+    sdata[tid] = partial;
+    barrier();
+    for (uint s = WG_SIZE/2u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    if (tid == 0u) c[n] = sdata[0];
+}

@@ -1,0 +1,5 @@
+{"id": "q1", "question": "At the speed of sound in air at 20 degrees Celsius, how many seconds does sound take to travel 10 kilometers? Round to the nearest second.", "answer": "29"}
+{"id": "q2", "question": "How many minutes does light take to travel from the Sun to the Earth? Round to the nearest minute.", "answer": "8"}
+{"id": "q3", "question": "How many grams heavier is one liter of whole milk than one liter of pure water at room temperature? Use typical densities and round to the nearest 10 grams.", "answer": "30"}
+{"id": "q4", "question": "How many trailing zeros does 100! have?", "answer": "24"}
+{"id": "q5", "question": "If each point of the circle x^2 + y^2 = 16 is reflected in the point (3, 2), the image points satisfy x^2 + y^2 + bx + cy + d = 0. Find the ordered triple (b, c, d).", "answer": "(-12, -8, 36)"}
