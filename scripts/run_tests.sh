@@ -20,13 +20,9 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-12}"
 FILTER="${1:-}"
 
 SCRIPTS=(
-  tests/test_vulkan_ops.py
-  tests/test_q4_kernel.py
-  tests/test_argmax_adversarial.py
-  tests/test_deadlock_regression.py
-  tests/test_placement.py
-  tests/test_placement2.py
-  tests/microtest_async_lifetime.py
+  tests/test_layer_vulkan.py
+  tests/test_gpu_kv_append.py
+  tests/test_stock_latent.py
 )
 
 pass=0
