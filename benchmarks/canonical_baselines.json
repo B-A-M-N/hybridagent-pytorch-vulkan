@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-04",
+  "harness": "test_100_latent_full.py (canonical HybridBackbone.forward, HybridLink, INT8 CPU layers, random 12-token prefill, 12 CPU threads)",
+  "steps": 100,
+  "kv_len_final": 112,
+  "cpu_only_gpu0": {"median_ms": 9030.1, "warm_median_ms": 9044.4, "mean_ms": 8985.0, "p95_ms": 9362.5, "cpu_layer_ms": 9042.1, "vulkan_layer_ms": 0.0, "finite": true},
+  "hetero_gpu5": {"median_ms": 6801.4, "warm_median_ms": 6759.8, "mean_ms": 6806.1, "p95_ms": 7211.3, "cpu_layer_ms": 6655.2, "vulkan_layer_ms": 109.2, "finite": true},
+  "speedup_hetero_vs_cpu": 1.34,
+  "notes": "20 GPU layers hangs in setup: FP32 VRAM ceiling (Q4 not numerically qualified). bf16 Int8Linear GEMV attempt rejected (slower, different numerics)."
+}
