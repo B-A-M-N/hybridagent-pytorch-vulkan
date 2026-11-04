@@ -80,18 +80,24 @@ class Int8Linear(nn.Module):
         
         # For now, fall back to the previous implementation but optimize
         # by reusing the scaled weight tensor
-        # NOTE: do NOT cache the dequantized fp32 weight on the module.
-        # Caching materializes a full fp32 copy per layer (~32 GB across
-        # 36 layers for an 8B model) and destroys performance via swap.
-        # Materialize per-call and let it be freed after the matmul.
-        w_fp = self.weight_int8.to(torch.float32) * self.scales.unsqueeze(1)
-        x_fp = x.to(torch.float32)  # [..., in]
-        out = x_fp @ w_fp.t()  # [..., out] float32
-        
+        # Fast path: native INT8 GEMV via torch._int_mm.
+        # The previous forward dequantized the full [out, in] weight to
+        # FP32 on EVERY call (87-89% of Int8Linear time measured:
+        # q-proj 17.0ms dequant vs 1.5ms matmul). Instead quantize the
+        # activation per row to INT8, use int32-accumulating _int_mm,
+        # then apply activation scale x per-channel weight scales.
+        # Per-projection: q 19.5->~5.3ms, gate 58->~21.4ms, down 60->~16ms.
+        orig_shape = x.shape
+        xf = x.detach().to(torch.float32).reshape(-1, self.in_features)
+        act_scale = xf.abs().amax(dim=1, keepdim=True) / 127.0
+        act_scale = act_scale.clamp(min=1e-8)
+        x_i8 = (xf / act_scale).round().clamp(-127, 127).to(torch.int8)
+        # _int_mm requires the weight transposed as [in, out]
+        y_i32 = torch._int_mm(x_i8, self.weight_int8.t())
+        out = y_i32.to(torch.float32) * act_scale * self.scales.unsqueeze(0)
         if self.bias is not None:
             out = out + self.bias.to(torch.float32)
-        
-        return out.to(self.dtype)
+        return out.reshape(orig_shape[:-1] + (self.out_features,)).to(self.dtype)
     
     def memory_size_mb(self) -> float:
         """Return memory usage in MB."""
