@@ -55,3 +55,10 @@ harness RAM footprint, dev scripts with absolute paths).
 Original HybridAgent code: `third_party/HybridAgent/` (MIT License).
 This repository's Vulkan backend, heterogeneous backbone, GPU KV cache,
 and INT8 CPU path are the additions.
+
+## Release status
+Clean-checkout install is currently BLOCKED: `third_party/` (HybridAgent,
+torch-vulkan) is not tracked in git and `scripts/install.sh` does not
+fetch it — see `RELEASE_QUALIFICATION.md` (P4). Building from this
+working tree (with vendored `third_party/` present) works and is what
+all benchmarks above were measured on.
